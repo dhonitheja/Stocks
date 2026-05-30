@@ -1,0 +1,71 @@
+# ============================================================
+#  .gitignore — StockSage AI Trading Agent
+#  NEVER commit secrets or local state to Git
+# ============================================================
+
+# ─── SECRETS (NEVER commit these) ────────────────────────────
+.env
+*.key
+*.pem
+secrets/
+
+# ─── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# ─── Virtual Environments ────────────────────────────────────
+venv/
+.venv/
+env/
+.env.local
+
+# ─── Logs (large, machine-generated) ─────────────────────────
+logs/
+*.log
+*.log.gz
+
+# ─── Database files ──────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+stocksage.db
+
+# ─── ML Model Cache (huge — download on first run) ───────────
+.cache/
+models/cache/
+~/.cache/huggingface/
+
+# ─── IDE / OS files ──────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Backtesting results (local only) ────────────────────────
+backtesting/data/
+backtesting/results/
+
+# ─── Reports (generated locally) ─────────────────────────────
+logs/reports/
+*.pdf
+
+# ─── Node (dashboard) ────────────────────────────────────────
+node_modules/
+.next/
+.nuxt/
+
+# ─── Generated / Tool Output (not source code) ───────────────
+graphify-out/
+.graphify/
+

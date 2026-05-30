@@ -1,0 +1,157 @@
+# ============================================================
+#  AI Stock Trading Agent — Configuration (US Markets)
+#  Broker: Alpaca (paper + live) | Fund: $100 USD
+# ============================================================
+
+agent:
+  name: "StockSage"
+  version: "1.0.0"
+  description: "Personal AI Trading Agent — 30-Year Veteran Mode (US Markets)"
+
+# ─── Market Settings ─────────────────────────────────────────
+market:
+  exchange: "NASDAQ"            # NASDAQ | NYSE
+  currency: "USD"
+  timezone: "America/New_York"
+
+  trading_hours:
+    start: "09:30"              # NYSE/NASDAQ open (ET)
+    end: "16:00"                # Market close (ET)
+    pre_market_analysis: "08:45" # Agent wakes up 45 mins early
+
+  # US stocks watchlist — fractional shares enabled via Alpaca
+  # All high-liquidity, well-known companies suitable for $100 fund
+  watchlist:
+    - "AAPL"     # Apple
+    - "MSFT"     # Microsoft
+    - "NVDA"     # NVIDIA
+    - "GOOGL"    # Alphabet
+    - "AMZN"     # Amazon
+    - "META"     # Meta
+    - "TSLA"     # Tesla
+    - "AMD"      # AMD
+    - "INTC"     # Intel
+    - "NFLX"     # Netflix
+    - "JPM"      # JPMorgan
+    - "BAC"      # Bank of America
+    - "SPY"      # S&P 500 ETF (market benchmark)
+    - "QQQ"      # Nasdaq 100 ETF
+
+  blacklisted_sectors: []
+
+# ─── Fund & Risk Management ──────────────────────────────────
+risk:
+  total_fund: 100.0           # Starting fund: $100 USD
+
+  # Position sizing — for $100, fractional shares are KEY
+  max_position_pct: 0.15      # Max 15% per trade ($15 max) — wider for small fund
+  max_sector_pct: 0.40        # Max 40% in one sector (relaxed for small fund)
+  min_cash_reserve_pct: 0.20  # Keep 20% cash ($20 reserve)
+
+  # Loss limits
+  max_daily_loss_pct: 0.05    # Auto-pause if daily loss > 5% ($5)
+  max_trade_loss_pct: 0.02    # Stop-loss per trade: 2%
+  trailing_stop_pct: 0.01     # Trailing stop: 1%
+
+  # Trade filters
+  min_confidence_score: 0.68  # Slightly relaxed for small-fund active trading
+  max_open_positions: 5       # Max 5 open at once (manageable with $100)
+  min_holding_minutes: 5
+
+  # Kill switches
+  circuit_breaker_enabled: true
+  news_blackout_events:
+    - "Fed Rate Decision"
+    - "CPI Release"
+    - "Jobs Report"
+    - "Election Results"
+    - "Market Circuit Breaker"
+
+# ─── Technical Analysis Settings ─────────────────────────────
+technical:
+  ema_periods: [9, 21, 50, 200]
+  rsi_period: 14
+  rsi_oversold: 32
+  rsi_overbought: 68
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  bb_period: 20
+  bb_std: 2.0
+  vwap_enabled: true
+  volume_surge_threshold: 1.8   # 1.8x avg volume = surge
+
+# ─── Sentiment Analysis Settings ─────────────────────────────
+sentiment:
+  model: "ProsusAI/finbert"
+  news_lookback_hours: 3
+  min_articles_for_signal: 2
+  strong_positive_threshold: 0.45
+  strong_negative_threshold: -0.35
+
+  # US-focused news RSS feeds
+  rss_feeds:
+    - name: "Reuters Business"
+      url: "https://feeds.reuters.com/reuters/businessNews"
+    - name: "CNBC Markets"
+      url: "https://www.cnbc.com/id/20409666/device/rss/rss.html"
+    - name: "MarketWatch"
+      url: "https://feeds.marketwatch.com/marketwatch/marketpulse/"
+    - name: "Seeking Alpha"
+      url: "https://seekingalpha.com/market_currents.xml"
+    - name: "Yahoo Finance"
+      url: "https://finance.yahoo.com/news/rssindex"
+    - name: "Investing.com"
+      url: "https://www.investing.com/rss/news.rss"
+
+# ─── Fundamental Analysis Settings ───────────────────────────
+fundamental:
+  min_market_cap_b: 10          # Min $10B market cap (large cap only)
+  max_pe_ratio: 100             # Tech stocks can have high P/E
+  min_roe: 0.10                 # Min 10% Return on Equity
+  max_debt_equity: 2.0
+
+# ─── Decision Fusion Weights ──────────────────────────────────
+decision_weights:
+  technical: 0.45
+  sentiment: 0.35
+  fundamental: 0.20
+
+# ─── Human-Like Behavior ─────────────────────────────────────
+behavior:
+  order_delay_min_seconds: 1
+  order_delay_max_seconds: 10
+  order_size_variance_pct: 0.03
+  skip_obvious_pump: true       # Skip if stock up >4% already today
+
+# ─── Cost Model (backtest realism) ───────────────────────────
+# A backtest without a cost model is a lie. (CLAUDE.md §4.2)
+cost_model:
+  commission_pct: 0.0       # Alpaca is commission-free
+  slippage_bps: 5           # 5 bps (0.05%) one-way — conservative for liquid large-caps
+  spread_bps: 3             # 3 bps half-spread assumption
+  market_impact_bps: 2      # 2 bps for ~$15 notional orders (negligible but honest)
+
+# ─── Execution Mode ──────────────────────────────────────────
+execution:
+  mode: "paper"     # paper | live  ← Start here! Switch to live after 30 days
+  # To enable live: set TRADING_MODE=live env var AND pass --i-understand-the-risk flag
+
+# ─── Broker: Alpaca ──────────────────────────────────────────
+# Alpaca supports:
+#  - Fractional shares (buy $5 of AAPL, etc.)
+#  - Free paper trading API
+#  - Commission-free live trading
+#  - $0 account minimum
+broker:
+  name: "alpaca"
+  paper_base_url: "https://paper-api.alpaca.markets"
+  live_base_url: "https://api.alpaca.markets"
+  data_url: "https://data.alpaca.markets"
+  fractional_shares: true       # Critical for $100 fund
+
+# ─── Notifications ───────────────────────────────────────────
+notifications:
+  telegram_enabled: false
+  email_enabled: false
+  daily_report_time: "16:30"    # Send after market close (4:30 PM ET)

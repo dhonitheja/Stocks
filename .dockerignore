@@ -1,0 +1,36 @@
+.env
+.env.*
+*.pem
+*.key
+secrets/
+credentials.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+htmlcov/
+.coverage
+
+# Logs & data
+logs/
+*.log
+stocksage.db
+
+# Git
+.git/
+.gitignore
+
+# Dev tools
+.vscode/
+.idea/
+*.swp
+
+# Docker
+docker-compose.override.yml
