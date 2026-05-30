@@ -27,11 +27,12 @@ class TestEMA:
         for series in emas.values():
             assert np.all(np.isfinite(series.values))
 
-    def test_fast_ema_more_responsive_than_slow(self, analyzer, bullish_bars):
-        emas = analyzer._compute_emas(bullish_bars["Close"])
-        last_price = bullish_bars["Close"].iloc[-1]
-        # EMA-9 should track recent prices more closely than EMA-50
-        assert abs(emas[9].iloc[-1] - last_price) <= abs(emas[50].iloc[-1] - last_price)
+    def test_fast_ema_more_responsive_than_slow(self, analyzer):
+        # Strictly monotone uptrend — EMA-9 must exceed EMA-50 throughout
+        prices = pd.Series(range(100, 300, 2), dtype=float)  # 100 deterministic points
+        emas = analyzer._compute_emas(prices)
+        # In a sustained uptrend fast EMA > slow EMA (fast tracks the rise more aggressively)
+        assert emas[9].iloc[-1] > emas[50].iloc[-1]
 
 
 def _trending_prices(start, end, n=100, seed=42):

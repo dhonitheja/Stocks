@@ -54,7 +54,7 @@ risk:
   trailing_stop_pct: 0.01     # Trailing stop: 1%
 
   # Trade filters
-  min_confidence_score: 0.68  # Slightly relaxed for small-fund active trading
+  min_confidence_score: 0.40  # Technical model peaks ~0.60; 0.40 requires 2+ indicators aligned
   max_open_positions: 5       # Max 5 open at once (manageable with $100)
   min_holding_minutes: 5
 

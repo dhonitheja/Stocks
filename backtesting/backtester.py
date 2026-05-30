@@ -97,6 +97,8 @@ class Backtester:
         for sym in symbols:
             try:
                 df = yf.download(sym, start=self.start, end=self.end, progress=False, auto_adjust=True)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = [col[0] for col in df.columns]
                 if len(df) > 50:
                     bars[sym] = df
                     logger.debug(f"[Backtest] {sym}: {len(df)} bars")

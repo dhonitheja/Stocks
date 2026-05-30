@@ -12,7 +12,7 @@ class TestCanBuy:
         assert dollar_amount > 0
 
     def test_blocked_below_confidence_threshold(self, risk_manager):
-        allowed, reason, qty = risk_manager.can_buy("AAPL", price=100.0, confidence=0.50)
+        allowed, reason, qty = risk_manager.can_buy("AAPL", price=100.0, confidence=0.30)
         assert allowed is False
         assert "Confidence" in reason
 

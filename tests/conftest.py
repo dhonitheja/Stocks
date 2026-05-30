@@ -23,21 +23,22 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # ── Price bar helpers ────────────────────────────────────────────
 
-def make_ohlcv(n: int = 100, start_price: float = 100.0, trend: float = 0.001) -> pd.DataFrame:
-    """Generate synthetic OHLCV data for indicator tests."""
+def make_ohlcv(n: int = 100, start_price: float = 100.0, trend: float = 0.001, seed: int = 42) -> pd.DataFrame:
+    """Generate deterministic synthetic OHLCV data for indicator tests."""
+    rng = np.random.default_rng(seed)
     prices = [start_price]
     for _ in range(n - 1):
-        change = np.random.normal(trend, 0.015)
+        change = rng.normal(trend, 0.015)
         prices.append(prices[-1] * (1 + change))
 
     prices = np.array(prices)
-    high = prices * np.random.uniform(1.001, 1.02, n)
-    low = prices * np.random.uniform(0.98, 0.999, n)
-    volume = np.random.randint(500_000, 5_000_000, n)
+    high = prices * rng.uniform(1.001, 1.02, n)
+    low = prices * rng.uniform(0.98, 0.999, n)
+    volume = rng.integers(500_000, 5_000_000, n)
 
     idx = pd.date_range(end=datetime.now(), periods=n, freq="D")
     return pd.DataFrame({
-        "Open": prices * np.random.uniform(0.999, 1.001, n),
+        "Open": prices * rng.uniform(0.999, 1.001, n),
         "High": high,
         "Low": low,
         "Close": prices,

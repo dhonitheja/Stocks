@@ -79,6 +79,11 @@ class TechnicalAnalyzer:
             return None
 
         try:
+            # yfinance ≥0.2.50 returns MultiIndex columns for single tickers — flatten
+            if isinstance(df.columns, pd.MultiIndex):
+                df = df.copy()
+                df.columns = [col[0] for col in df.columns]
+
             close = df["Close"].astype(float)
             high = df["High"].astype(float)
             low = df["Low"].astype(float)
@@ -95,15 +100,15 @@ class TechnicalAnalyzer:
             pattern = self._detect_candlestick_pattern(df)
 
             # Latest values
-            last_close = float(close.iloc[-1])
-            last_rsi = float(rsi.dropna().iloc[-1]) if not rsi.dropna().empty else 50.0
-            last_macd = float(macd.iloc[-1])
-            last_macd_hist = float(macd_hist.iloc[-1])
-            last_vwap = float(vwap.iloc[-1]) if len(vwap) > 0 else last_close
-            last_volume = float(volume.iloc[-1])
-            last_avg_vol = float(avg_volume.iloc[-1]) if not pd.isna(avg_volume.iloc[-1]) else last_volume
+            last_close = float(close.iat[-1])
+            last_rsi = float(rsi.dropna().iat[-1]) if not rsi.dropna().empty else 50.0
+            last_macd = float(macd.iat[-1])
+            last_macd_hist = float(macd_hist.iat[-1])
+            last_vwap = float(vwap.iat[-1]) if len(vwap) > 0 else last_close
+            last_volume = float(volume.iat[-1])
+            last_avg_vol = float(avg_volume.iat[-1]) if not pd.isna(avg_volume.iat[-1]) else last_volume
 
-            ema_vals = {p: float(emas[p].iloc[-1]) for p in self.ema_periods}
+            ema_vals = {p: float(emas[p].iat[-1]) for p in self.ema_periods}
 
             # ── Individual signal classifications ────────────
             trend = self._classify_trend(last_close, ema_vals)
@@ -154,10 +159,10 @@ class TechnicalAnalyzer:
             # VWAP score
             if vwap_sig == "ABOVE":
                 scores.append(0.15)
-                reasons.append(f"price ₹{last_close:.1f} above VWAP ₹{last_vwap:.1f}")
+                reasons.append(f"price ${last_close:.1f} above VWAP ${last_vwap:.1f}")
             else:
                 scores.append(-0.15)
-                reasons.append(f"price ₹{last_close:.1f} below VWAP ₹{last_vwap:.1f}")
+                reasons.append(f"price ${last_close:.1f} below VWAP ${last_vwap:.1f}")
 
             # Volume score
             if vol_sig == "SURGE":
@@ -323,10 +328,10 @@ class TechnicalAnalyzer:
         if len(df) < 2:
             return "none"
 
-        o = float(df["Open"].iloc[-1])
-        h = float(df["High"].iloc[-1])
-        l = float(df["Low"].iloc[-1])
-        c = float(df["Close"].iloc[-1])
+        o = float(df["Open"].iat[-1])
+        h = float(df["High"].iat[-1])
+        l = float(df["Low"].iat[-1])
+        c = float(df["Close"].iat[-1])
         body = abs(c - o)
         total_range = h - l
 
@@ -344,8 +349,8 @@ class TechnicalAnalyzer:
             return "hammer"
 
         # Engulfing
-        prev_o = float(df["Open"].iloc[-2])
-        prev_c = float(df["Close"].iloc[-2])
+        prev_o = float(df["Open"].iat[-2])
+        prev_c = float(df["Close"].iat[-2])
         if c > prev_o and o < prev_c and c > o:
             return "engulfing_bull"
         elif c < prev_o and o > prev_c and c < o:

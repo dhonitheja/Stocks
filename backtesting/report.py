@@ -42,7 +42,7 @@ class BacktestReport:
         if not sells:
             return 0.0
         wins = sum(1 for t in sells if t.pnl > 0)
-        return wins / len(sells) * 100
+        return wins / len(sells)
 
     @property
     def total_pnl(self) -> float:
@@ -90,7 +90,7 @@ class BacktestReport:
 
         table.add_row("Total trades", str(len(self.trades)))
         table.add_row("Closed positions", str(len(self.sell_trades)))
-        table.add_row("Win rate", f"{self.win_rate:.1f}%")
+        table.add_row("Win rate", f"{self.win_rate * 100:.1f}%")
         table.add_row("Avg P&L / trade", f"${self.avg_pnl_per_trade:+.4f}")
         table.add_row("Max win", f"${self.max_win:+.4f}")
         table.add_row("Max loss", f"${self.max_loss:+.4f}")
