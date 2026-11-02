@@ -12,7 +12,7 @@ Research only. No buy/sell calls, no orders.
 1. Tickers: `python scripts/research/repo_signals.py --watchlist` (reads `market.watchlist` in `config/settings.yaml`, so there is one list to maintain). If the user names tickers, use those.
 2. `python scripts/research/stock_data.py scan <tickers>`; on free keys scan in batches of 8-10 (see `stock-data` limits).
 3. For tickers with |day change| above 3% or relative volume above 2, fetch `news T --days 2`.
-4. `earnings T` for each; keep only entries in the `upcoming` list within 10 days. `reported_history` is past data, and an empty `upcoming` means none in the next 120 days.
+4. `earnings T` for each; keep only entries in the `upcoming` list within 10 days. `reported_history` is past data. An empty `upcoming` means "none found in provider data" (coverage can be missing), and `upcoming: null` (Alpha Vantage) means unknown: say so and suggest checking the company's investor-relations page.
 5. Optional: run `repo_signals.py T` on the 3 most notable names to show StockSage's own read.
 
 ## Output

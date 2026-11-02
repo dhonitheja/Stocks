@@ -13,7 +13,7 @@ Research only. Never give buy/sell/hold calls or targets, and never place or sug
 2. Fetch in parallel with the `stock-data` skill: `quote`, `indicators`, `news --days 7`, `earnings`.
 3. Get the repo's own read, so research matches what the agent sees:
    `python scripts/research/repo_signals.py T --fundamentals`
-   This returns StockSage's `TechnicalAnalyzer` output and the `FundamentalScorer` 0-1 score. Report its trend, RSI/MACD state, EMAs, support/resistance, pattern and confidence. Do NOT quote its `action` field (BUY/SELL/HOLD): that is a trading-loop input, not research output. If asked, call it the model's "lean" (bullish / bearish / neutral). If `yfinance` or other deps are missing, skip it and say so.
+   This returns StockSage's `TechnicalAnalyzer` output and the `FundamentalScorer` 0-1 score. The fundamental score of 0.5 can mean neutral or unknown, so say that. Report its trend, RSI/MACD state, EMAs, support/resistance, pattern and confidence. Do NOT quote its `action` field (BUY/SELL/HOLD): that is a trading-loop input, not research output. If asked, call it the model's "lean" (bullish / bearish / neutral). If `yfinance` or other deps are missing, skip it and say so.
 4. Run the `sentiment-scan` skill.
 5. Catalysts: `mcporter call exa.web_search_exa query="T 8-K guidance downgrade this week" numResults=5` (agent-reach), if available.
 

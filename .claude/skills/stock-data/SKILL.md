@@ -26,6 +26,6 @@ Keys: `FINNHUB_API_KEY`, `POLYGON_API_KEY`, and `ALPHA_VANTAGE_KEY` (already in 
 | Polygon (Massive) | 5 calls/min, end-of-day, 2y history | Snapshot/real-time is paid |
 | Alpha Vantage | 25 calls/day | Errors arrive as HTTP 200 with an `Information` message; `scan` uses about 2 calls per ticker |
 
-Keep scans under about 10 tickers on free keys. Polygon calls are paced at about 12.5s (set `POLYGON_MIN_INTERVAL=0` on a paid plan). Polygon prices are split-adjusted; Alpha Vantage daily prices are not, so indicators can differ by provider after a split. Report the exact error when every provider fails; never fill gaps from memory.
+Keep scans under about 10 tickers on free keys. Polygon calls are paced at about 12.5s across all processes (set `POLYGON_MIN_INTERVAL=0` on a paid plan), the free plan's 403 on the snapshot endpoint is remembered for 6 hours, and a 429 retry honors `Retry-After`. Placeholder keys such as `your_polygon_key_here` are ignored. Alpha Vantage daily data can include a partial bar for today during market hours, which understates relative volume. Polygon prices are split-adjusted; Alpha Vantage daily prices are not, so indicators can differ by provider after a split. Report the exact error when every provider fails; never fill gaps from memory.
 
 Not investment advice.

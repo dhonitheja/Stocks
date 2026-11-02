@@ -30,32 +30,38 @@ import re
 import time
 
 _PROVIDER_VARS = ("FINNHUB_API_KEY", "POLYGON_API_KEY", "ALPHAVANTAGE_API_KEY", "ALPHA_VANTAGE_KEY")
+
+
+def today_et():
+    """Today's date in US/Eastern (falls back to local time if tz data is unavailable)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).date()
+    except Exception:
+        return date.today()
+
+
+def real_key(v):
+    """False for empty values and the placeholders shipped in .env.example (your_..._here)."""
+    v = (v or "").strip()
+    return bool(v) and not (v.lower().startswith("your_") or v.lower().endswith("_here"))
+
+
 if not os.environ.get("STOCK_DATA_NO_DOTENV"):
     try:  # copy ONLY the provider keys from the project's .env; never load the rest of the file
         from dotenv import dotenv_values
         for _k, _v in dotenv_values().items():
-            if _k in _PROVIDER_VARS and _v and not os.environ.get(_k):
+            if _k in _PROVIDER_VARS and real_key(_v) and not real_key(os.environ.get(_k)):
                 os.environ[_k] = _v
     except ImportError:
         pass
 
 # StockSage's .env.example already names the Alpha Vantage key ALPHA_VANTAGE_KEY; accept both spellings.
-if os.environ.get("ALPHA_VANTAGE_KEY") and not os.environ.get("ALPHAVANTAGE_API_KEY"):
+if real_key(os.environ.get("ALPHA_VANTAGE_KEY")) and not real_key(os.environ.get("ALPHAVANTAGE_API_KEY")):
     os.environ["ALPHAVANTAGE_API_KEY"] = os.environ["ALPHA_VANTAGE_KEY"]
 
 ENV = {"finnhub": "FINNHUB_API_KEY", "polygon": "POLYGON_API_KEY",
        "alphavantage": "ALPHAVANTAGE_API_KEY"}
-
-
-def pick_provider(requested=None):
-    if requested:
-        if not os.environ.get(ENV[requested]):
-            sys.exit(f"error: {ENV[requested]} is not set")
-        return requested
-    for name, var in ENV.items():
-        if os.environ.get(var):
-            return name
-    sys.exit("error: no API key found. Set FINNHUB_API_KEY, POLYGON_API_KEY or ALPHAVANTAGE_API_KEY")
 
 
 TICKER_RE = re.compile(r"[A-Z][A-Z0-9.\-]{0,9}")
@@ -79,17 +85,83 @@ def redact(msg):
     return msg
 
 
-_last_call = {}
+import tempfile
+
+_STATE_FILE = os.path.join(tempfile.gettempdir(), f"stock_data_state_{os.getuid() if hasattr(os, 'getuid') else 'u'}.json")
+_MAX_BYTES = 5_000_000  # refuse absurdly large responses
+
+
+def _with_state(fn):
+    """Run fn(state_dict) under an inter-process lock; state is saved back. Shared by all CLI runs
+    (the agent fetches in parallel), so pacing and 403 memory hold across processes."""
+    try:
+        import fcntl
+    except ImportError:  # Windows: best effort without a lock
+        fcntl = None
+    try:
+        fd = os.open(_STATE_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return fn({})
+    try:
+        if fcntl:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        raw = b""
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            raw += chunk
+        try:
+            state = json.loads(raw or b"{}")
+            if not isinstance(state, dict):
+                state = {}
+        except ValueError:
+            state = {}
+        result = fn(state)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, json.dumps(state).encode())
+        return result
+    finally:
+        os.close(fd)  # closing releases the flock
+
+
+def _polygon_wait():
+    """Reserve the next Polygon slot (free plan: 5 calls/min). POLYGON_MIN_INTERVAL=0 on paid plans."""
+    gap = float(os.environ.get("POLYGON_MIN_INTERVAL", "12.5"))
+    if gap <= 0:
+        return 0.0
+
+    def reserve(state):
+        now = time.time()
+        slot = max(now, float(state.get("polygon_next", 0)))
+        state["polygon_next"] = slot + gap
+        return slot - now
+
+    return _with_state(reserve)
+
+
+def snapshot_forbidden():
+    """True if Polygon's snapshot endpoint answered 403 recently (free plan); saves ~12s per quote."""
+    return _with_state(lambda st: time.time() < float(st.get("snapshot_403_until", 0)))
+
+
+def note_snapshot_forbidden():
+    _with_state(lambda st: st.__setitem__("snapshot_403_until", time.time() + 6 * 3600))
 
 
 def _throttle(url):
-    # Polygon free plan allows 5 calls/min. Set POLYGON_MIN_INTERVAL=0 on a paid plan.
     if "polygon.io" in url:
-        gap = float(os.environ.get("POLYGON_MIN_INTERVAL", "12.5"))
-        wait = _last_call.get("polygon", 0) + gap - time.time()
+        wait = _polygon_wait()
         if wait > 0:
             time.sleep(wait)
-        _last_call["polygon"] = time.time()
+
+
+def _retry_after(e):
+    try:
+        return min(max(float(e.headers.get("Retry-After", "")), 1.0), 65.0)
+    except (TypeError, ValueError, AttributeError):
+        return 12.0
 
 
 def http_json(url, params, _retry=True):
@@ -98,13 +170,13 @@ def http_json(url, params, _retry=True):
     req = urllib.request.Request(full, headers={"User-Agent": "stock-agent/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
-            d = json.load(r)
+            d = json.loads(r.read(_MAX_BYTES + 1)[:_MAX_BYTES] if hasattr(r, "read") else r)
     except urllib.error.HTTPError as e:
         if e.code == 403:
             raise RuntimeError("403: endpoint needs a paid plan on this provider") from None
         if e.code == 429:
             if _retry:
-                time.sleep(12)
+                time.sleep(_retry_after(e))
                 return http_json(url, params, _retry=False)
             raise RuntimeError("429: rate limited") from None
         raise RuntimeError(f"HTTP {e.code} from {urllib.parse.urlparse(url).netloc}") from None
@@ -124,7 +196,7 @@ def key(p):
 
 # ---------- candles (normalized: list of {date, o, h, l, c, v}, oldest first) ----------
 def candles(p, t, days):
-    end = date.today()
+    end = today_et()
     start = end - timedelta(days=int(days * 1.6) + 5)  # calendar days to cover trading days
     out = []
     if p == "finnhub":
@@ -162,8 +234,15 @@ def quote(p, t):
                 "high": d.get("h"), "low": d.get("l"), "open": d.get("o"), "prev_close": d.get("pc")}
     if p == "polygon":
         try:
-            d = http_json(f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{urllib.parse.quote(t, safe='')}",
-                          {"apiKey": key(p)}).get("ticker", {})
+            if snapshot_forbidden():
+                raise RuntimeError("403: snapshot known to need a paid plan")
+            try:
+                d = http_json(f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{urllib.parse.quote(t, safe='')}",
+                              {"apiKey": key(p)}).get("ticker", {})
+            except RuntimeError as e:
+                if str(e).startswith("403"):
+                    note_snapshot_forbidden()
+                raise
         except RuntimeError:  # snapshot is paid; free plan is end-of-day, so use last daily bars
             bars = candles(p, t, 5)
             if len(bars) < 2:
@@ -191,10 +270,10 @@ def quote(p, t):
 
 
 def news(p, t, days):
-    start = (date.today() - timedelta(days=days)).isoformat()
+    start = (today_et() - timedelta(days=days)).isoformat()
     if p == "finnhub":
         d = http_json("https://finnhub.io/api/v1/company-news",
-                      {"symbol": t, "from": start, "to": date.today().isoformat(), "token": key(p)})
+                      {"symbol": t, "from": start, "to": today_et().isoformat(), "token": key(p)})
         return [{"time": datetime.fromtimestamp(x["datetime"], timezone.utc).isoformat(),
                  "headline": x["headline"], "source": x["source"], "url": x["url"]} for x in d[:25]]
     if p == "polygon":
@@ -212,9 +291,10 @@ def news(p, t, days):
 def earnings(p, t):
     if p == "finnhub":
         d = http_json("https://finnhub.io/api/v1/calendar/earnings",
-                      {"symbol": t, "from": date.today().isoformat(),
-                       "to": (date.today() + timedelta(days=120)).isoformat(), "token": key(p)})
-        return {"upcoming": d.get("earningsCalendar", []), "window_days": 120}
+                      {"symbol": t, "from": today_et().isoformat(),
+                       "to": (today_et() + timedelta(days=120)).isoformat(), "token": key(p)})
+        return {"upcoming": d.get("earningsCalendar", []), "window_days": 120,
+                "note": "An empty list means none found in this provider's data, not a guarantee."}
     if p == "alphavantage":
         d = http_json("https://www.alphavantage.co/query", {"function": "EARNINGS", "symbol": t, "apikey": key(p)})
         return {"upcoming": None, "reported_history": d.get("quarterlyEarnings", [])[:4],
@@ -306,12 +386,12 @@ ORDER = {"quote": ["finnhub", "polygon", "alphavantage"],
 
 def run(task, fn, forced=None):
     """Try configured providers in order; return (provider, result). Errors are collected, not hidden."""
-    avail = [forced] if forced else [x for x in ORDER[task] if os.environ.get(ENV[x])]
+    avail = [forced] if forced else [x for x in ORDER[task] if real_key(os.environ.get(ENV[x]))]
     if not avail:
         sys.exit("error: no API key found. Set FINNHUB_API_KEY, POLYGON_API_KEY or ALPHAVANTAGE_API_KEY")
     errors = []
     for p in avail:
-        if not os.environ.get(ENV[p]):
+        if not real_key(os.environ.get(ENV[p])):
             sys.exit(f"error: {ENV[p]} is not set")
         try:
             res = fn(p)
@@ -330,6 +410,9 @@ def main():
     ap.add_argument("--provider", choices=list(ENV))
     ap.add_argument("--days", type=int)
     a = ap.parse_args()
+    days = a.days
+    if days is not None and days < 1:
+        sys.exit("error: --days must be 1 or more")
     tickers = [valid_ticker(t) for t in a.tickers]
     if a.cmd != "scan" and len(tickers) > 1:
         sys.exit("error: this command takes one ticker; use scan for several")
@@ -337,13 +420,13 @@ def main():
     if a.cmd == "quote":
         p, res = run("quote", lambda p: quote(p, t), f)
     elif a.cmd == "candles":
-        p, res = run("candles", lambda p: candles(p, t, a.days or 120), f)
+        p, res = run("candles", lambda p: candles(p, t, days or 120), f)
     elif a.cmd == "news":
-        p, res = run("news", lambda p: news(p, t, a.days or 7), f)
+        p, res = run("news", lambda p: news(p, t, days or 7), f)
     elif a.cmd == "earnings":
         p, res = run("earnings", lambda p: earnings(p, t), f)
     elif a.cmd == "indicators":
-        p, res = run("candles", lambda p: candles(p, t, a.days or 250), f)
+        p, res = run("candles", lambda p: candles(p, t, days or 250), f)
         res = indicators(res)
     else:
         p, res = "mixed", []

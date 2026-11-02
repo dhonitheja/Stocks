@@ -12,7 +12,7 @@ Depends on the `agent-reach` skill for web, Reddit and X. Announce "using agent-
 1. Provider news: `python scripts/research/stock_data.py news T --days 7`.
 2. Web: `mcporter call exa.web_search_exa query="T stock news analysis" numResults=8`.
 3. Reddit: `rdt search "T" --limit 15` (or `opencli reddit search "T" -f yaml`); r/wallstreetbets, r/stocks, r/investing, r/options.
-4. X: `twitter search "$T" -n 15` if configured; skip if doctor shows no backend.
+4. X: `twitter search '$NVDA' -n 15` (single quotes, with the real ticker in place of NVDA, so the shell does not expand the cashtag to an empty string) if configured; skip if doctor shows no backend.
 5. Label each item bullish, bearish or neutral from its text and count them.
 
 ## Output

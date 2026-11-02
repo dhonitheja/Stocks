@@ -16,6 +16,7 @@ The signal it prints is context for a human, not an instruction to trade.
 import argparse
 import dataclasses
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -41,8 +42,22 @@ def to_frame(candles):
     return df[["Open", "High", "Low", "Close", "Volume"]]
 
 
+def _scrub_env_after(importer):
+    """agent.config calls load_dotenv(), which would put the WHOLE .env (broker, Telegram, DB
+    secrets) in this process. Keep only what existed before plus the data-provider keys."""
+    before = set(os.environ)
+    result = importer()
+    for k in set(os.environ) - before:
+        if k not in stock_data._PROVIDER_VARS:
+            del os.environ[k]
+    return result
+
+
 def repo_technical(ticker, days=250, forced=None):
-    from agent.models.technical_indicators import TechnicalAnalyzer
+    def _imp():
+        from agent.models.technical_indicators import TechnicalAnalyzer
+        return TechnicalAnalyzer
+    TechnicalAnalyzer = _scrub_env_after(_imp)
     provider, candles = stock_data.run("candles", lambda p: stock_data.candles(p, ticker, days), forced)
     sig = TechnicalAnalyzer().analyze(ticker, to_frame(candles))
     return provider, (dataclasses.asdict(sig) if sig else None)
@@ -60,13 +75,16 @@ def main():
         return
     if not a.ticker:
         ap.error("ticker required (or use --watchlist)")
-    t = a.ticker.upper()
+    t = stock_data.valid_ticker(a.ticker)
     provider, tech = repo_technical(t, forced=a.provider)
     out = {"ticker": t, "candle_provider": provider, "repo_technical": tech,
            "note": "Research context only. Not an order and not investment advice."}
     if a.fundamentals:
-        from agent.models.fundamental_scorer import FundamentalScorer
-        out["fundamental_score_0_to_1"] = FundamentalScorer().score(t)
+        def _imp2():
+            from agent.models.fundamental_scorer import FundamentalScorer
+            return FundamentalScorer
+        out["fundamental_score_0_to_1"] = _scrub_env_after(_imp2)().score(t)
+        out["fundamental_note"] = "0.5 can mean neutral OR unknown (data missing)."
     print(json.dumps(out, indent=2, default=str))
 
 

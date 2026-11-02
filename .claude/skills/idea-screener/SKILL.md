@@ -19,7 +19,7 @@ Cap at 25 tickers. Polygon's free plan allows 5 calls/min and the script paces i
    - **Oversold bounce**: rsi14 < 35, above_sma200, macd_hist > macd_hist_prev.
    - **Breakout**: last_close within 1% of resistance_20d_high, rel_volume > 1.5, above_sma50.
    - **Volume surge**: rel_volume > 2.5 and |change_pct| > 3.
-   - **Pre-earnings run**: above_sma50 and an upcoming earnings date within 14 days. `scan` does not include earnings, so run `earnings T` only on tickers that already pass the other filters. Only the `upcoming` list counts; `reported_history` is past data.
+   - **Pre-earnings run**: above_sma50 and an upcoming earnings date within 14 days. `scan` does not include earnings, so run `earnings T` only on tickers that already pass the other filters. Only the `upcoming` list counts; `reported_history` is past data; `upcoming: null` or empty means unknown or none found in provider data, so do not report the stock as having no earnings.
 3. For the top 5 hits run `python scripts/research/repo_signals.py T` and note whether StockSage's own analyzer leans the same way (bullish / bearish / neutral, with its confidence versus `min_confidence_score` in `config/settings.yaml`). Never quote its BUY/SELL string. Disagreement is useful information; report it.
 4. Add one catalyst line per hit from `news T --days 3`.
 
