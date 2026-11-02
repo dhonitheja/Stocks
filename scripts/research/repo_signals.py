@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Bridge between the research skills and StockSage's own analytics. Read-only.
+
+Reuses code the agent already has so research and trading views agree:
+  - agent.models.technical_indicators.TechnicalAnalyzer  (repo's own BUY/SELL/HOLD read)
+  - agent.models.fundamental_scorer.FundamentalScorer     (yfinance 0-1 score, optional)
+  - config/settings.yaml market.watchlist                 (single source of truth for tickers)
+
+Usage:
+  python scripts/research/repo_signals.py --watchlist
+  python scripts/research/repo_signals.py AAPL [--fundamentals]
+
+This script never imports brokers or the execution engine and never places orders.
+The signal it prints is context for a human, not an instruction to trade.
+"""
+import argparse
+import dataclasses
+import json
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent.parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(ROOT))
+
+import stock_data  # noqa: E402
+
+
+def watchlist():
+    import yaml
+    with open(ROOT / "config" / "settings.yaml", encoding="utf-8") as f:
+        return yaml.safe_load(f)["market"]["watchlist"]
+
+
+def to_frame(candles):
+    import pandas as pd
+    df = pd.DataFrame(candles).rename(
+        columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+    df.index = pd.to_datetime(df.pop("date"))
+    return df[["Open", "High", "Low", "Close", "Volume"]]
+
+
+def repo_technical(ticker, days=250, forced=None):
+    from agent.models.technical_indicators import TechnicalAnalyzer
+    provider, candles = stock_data.run("candles", lambda p: stock_data.candles(p, ticker, days), forced)
+    sig = TechnicalAnalyzer().analyze(ticker, to_frame(candles))
+    return provider, (dataclasses.asdict(sig) if sig else None)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("ticker", nargs="?")
+    ap.add_argument("--watchlist", action="store_true", help="print tickers from config/settings.yaml")
+    ap.add_argument("--fundamentals", action="store_true", help="add FundamentalScorer score (needs yfinance)")
+    ap.add_argument("--provider", choices=list(stock_data.ENV))
+    a = ap.parse_args()
+    if a.watchlist:
+        print(json.dumps({"watchlist": watchlist()}))
+        return
+    if not a.ticker:
+        ap.error("ticker required (or use --watchlist)")
+    t = a.ticker.upper()
+    provider, tech = repo_technical(t, forced=a.provider)
+    out = {"ticker": t, "candle_provider": provider, "repo_technical": tech,
+           "note": "Research context only. Not an order and not investment advice."}
+    if a.fundamentals:
+        from agent.models.fundamental_scorer import FundamentalScorer
+        out["fundamental_score_0_to_1"] = FundamentalScorer().score(t)
+    print(json.dumps(out, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()

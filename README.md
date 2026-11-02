@@ -38,6 +38,10 @@ python -m agent.main
 
 ---
 
+## 🔎 Research skills (read-only)
+
+Claude skills for ticker research, a watchlist brief, sentiment scans and setup screening live in `.claude/skills/`, with a research-only `stock-analyst` agent. They never place orders. See [docs/research-skills.md](docs/research-skills.md).
+
 ## 📁 Project Structure
 
 ```
