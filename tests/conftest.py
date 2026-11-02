@@ -67,9 +67,10 @@ def flat_bars():
 # ── RiskManager fixture ──────────────────────────────────────────
 
 @pytest.fixture
-def risk_manager():
+def risk_manager(tmp_path):
     from agent.core.risk_manager import RiskManager
-    return RiskManager()
+    # Isolated state file so tests never read or write a developer's real logs/risk_state.json
+    return RiskManager(state_path=tmp_path / "risk_state.json")
 
 
 # ── Mock yfinance ────────────────────────────────────────────────

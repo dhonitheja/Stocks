@@ -50,6 +50,7 @@ risk:
 
   # Loss limits
   max_daily_loss_pct: 0.05    # Auto-pause if daily loss > 5% ($5)
+  max_drawdown_pct: 0.15      # HALT new buys if equity falls 15% below its peak (persists across restarts)
   max_trade_loss_pct: 0.02    # Stop-loss per trade: 2%
   trailing_stop_pct: 0.01     # Trailing stop: 1%
 

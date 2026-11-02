@@ -83,6 +83,7 @@ class StockSageAgent:
 
         # Track today's decisions
         self._decisions: Dict[str, TradeDecision] = {}
+        self._exit_alerted: set = set()
         self._cycle_count = 0
 
     # ─── Startup ──────────────────────────────────────────────
@@ -99,6 +100,12 @@ class StockSageAgent:
 
         # Restore open positions from last session
         self._recover_positions()
+        self._reconcile_with_broker()
+        if self.risk_manager.state_missing:
+            self.notifier.error(
+                "No risk state file found at startup (fresh peak, no drawdown halt, realized P&L "
+                "starts at 0). Expected on a first run; otherwise logs/ may have been lost."
+            )
 
         # Start data feeds
         self.price_feed.start()
@@ -179,6 +186,12 @@ class StockSageAgent:
         """Execute a BUY or SELL decision through the broker."""
 
         if decision.action == "BUY":
+            # Belt and braces: the risk layer already vetoed in can_buy, but a halt can trip
+            # between decision and execution.
+            if self.risk_manager.drawdown_halted or self.risk_manager.emergency_stop:
+                logger.warning(f"BUY {decision.symbol} skipped: trading halted by risk layer")
+                return
+
             # Calculate dollar amount to invest
             dollar_amount = min(
                 self.cfg["risk"]["total_fund"] * self.cfg["risk"]["max_position_pct"],
@@ -191,6 +204,11 @@ class StockSageAgent:
 
             # Human-like delay
             self.decision_engine.apply_human_delay()
+
+            # The human-like delay above can last seconds; a halt may have tripped meanwhile.
+            if not self.risk_manager.trading_allowed():
+                logger.warning(f"BUY {decision.symbol} cancelled: trading halted during order delay")
+                return
 
             # Place order
             result = self.execution.buy(
@@ -208,6 +226,7 @@ class StockSageAgent:
                     price=fill_price,
                     quantity=fill_qty,
                 )
+                self._persist_positions()
                 console.print(
                     f"[bold green]✅ BOUGHT[/bold green] "
                     f"[cyan]{decision.symbol}[/cyan] "
@@ -236,6 +255,7 @@ class StockSageAgent:
                     decision.price,
                     "AI signal",
                 )
+                self._persist_positions()
                 emoji = "🟢" if pnl >= 0 else "🔴"
                 console.print(
                     f"[bold red]{emoji} SOLD[/bold red] "
@@ -268,19 +288,95 @@ class StockSageAgent:
         except Exception as exc:
             logger.warning(f"[Recovery] Could not restore positions: {exc}")
 
+    def _reconcile_with_broker(self) -> None:
+        """Make the risk layer's positions match the broker (the source of truth) on startup."""
+        try:
+            # get_account()/get_positions() swallow errors and return {}/[]; an empty account
+            # means the broker was unreachable, and then positions must NOT be reconciled.
+            if not self.execution.get_account():
+                logger.warning("[Reconcile] Broker unreachable; skipping position reconciliation")
+                return
+            # Strict call: raises on failure instead of returning [] (which would look like "flat").
+            result = self.risk_manager.reconcile_positions(self.execution.get_positions_strict())
+            if result["dropped"] or result["resized"] or result["untracked"] or result["blocked_empty"]:
+                msg = (
+                    f"Reconciled with broker | dropped={result['dropped']} "
+                    f"resized={result['resized']} untracked(not adopted)={result['untracked']} "
+                    f"NOT dropped (broker showed none; verify manually)={result['blocked_empty']}"
+                )
+                console.print(f"[yellow]⚠️  {msg}[/yellow]")
+                self.notifier.error(msg)
+                self._persist_positions()
+        except Exception as exc:
+            logger.warning(f"[Reconcile] Could not reconcile with broker: {exc}")
+
+    def _process_exit(self, symbol: str, price: float, reason: str) -> bool:
+        """Sell at the broker, and record the close only if the broker accepted the order."""
+        if symbol not in self.risk_manager.positions:
+            return False  # already closed by another path (e.g. the AI SELL); nothing to do
+        logger.warning(f"🛑 Auto-exit: {symbol} @ ${price:.2f} ({reason})")
+        result = self.execution.sell(symbol, reason=reason)
+        if result.status in ("error", "rejected"):
+            err = (result.error_msg or "").lower()
+            if ("position does not exist" in err or "40410000" in err) and self._absent_at_broker(symbol):
+                # Confirmed against the broker's position list (not just an error string).
+                logger.warning(f"{symbol} is not held at the broker; closing local record")
+                self.risk_manager.close_position(symbol, price, "closed_at_broker")
+                self._persist_positions()
+                self.notifier.error(f"{symbol} was already closed at the broker; local record cleared")
+                self._exit_alerted.discard(symbol)
+                return True
+            logger.error(f"Exit sell failed for {symbol}: {result.error_msg}")
+            if symbol not in self._exit_alerted:  # alert once per symbol, not every minute
+                self._exit_alerted.add(symbol)
+                self.notifier.error(f"Exit sell FAILED for {symbol}: {result.error_msg} (retrying each cycle)")
+            return False
+        self._exit_alerted.discard(symbol)
+        pnl = self.risk_manager.close_position(symbol, price, reason)
+        self._persist_positions()
+        self.notifier.stop_loss(symbol, price, pnl)
+        return True
+
+    def _absent_at_broker(self, symbol: str) -> bool:
+        """True only if a successful positions call shows the symbol is not held."""
+        try:
+            held = {str(p["symbol"]).upper().strip() for p in self.execution.get_positions_strict()}
+            return symbol.upper() not in held
+        except Exception as exc:
+            logger.warning(f"Could not confirm {symbol} absence at broker: {exc}")
+            return False
+
+    def _check_drawdown(self) -> None:
+        """Evaluate the overall drawdown halt using latest prices; alert when it trips."""
+        was_halted = self.risk_manager.drawdown_halted
+        prices = {
+            s: tick.ltp for s, tick in self.price_feed.get_all_ticks().items() if tick
+        }
+        if self.risk_manager.check_drawdown(prices) and not was_halted:
+            msg = (
+                f"MAX DRAWDOWN HALT: equity is {self.risk_manager.max_drawdown_pct:.0%}+ below "
+                f"peak. New buys are blocked until an operator resets the halt."
+            )
+            if self.risk_manager.state_save_failed:
+                msg += " WARNING: halt state could NOT be saved; a restart may clear it."
+            console.print(f"[bold red]🔴 {msg}[/bold red]")
+            self.notifier.error(msg)
+
     # ─── Stop-Loss Monitor ────────────────────────────────────
 
     def _start_exit_monitor(self):
         """Background thread: check stop-losses every 60 seconds."""
         def monitor():
             while self._running:
-                if self.price_feed.is_market_open():
-                    exits = self.decision_engine.check_exits()
-                    for symbol, price, reason in exits:
-                        logger.warning(f"🛑 Auto-exit: {symbol} @ ${price:.2f} ({reason})")
-                        self.execution.sell(symbol, reason=reason)
-                        pnl = self.risk_manager.close_position(symbol, price, reason)
-                        self.notifier.stop_loss(symbol, price, pnl)
+                try:
+                    if self.price_feed.is_market_open():
+                        self._check_drawdown()
+                        exits = self.decision_engine.check_exits()
+                        for symbol, price, reason in exits:
+                            self._process_exit(symbol, price, reason)
+                except Exception as exc:  # a monitor crash must not silently stop protection
+                    logger.exception(f"Exit monitor error: {exc}")
+                    self.notifier.error(f"Exit monitor error: {exc}")
                 time.sleep(60)
 
         t = threading.Thread(target=monitor, daemon=True, name="ExitMonitor")
@@ -440,9 +536,10 @@ class StockSageAgent:
                 }
                 for sym, pos in self.risk_manager.positions.items()
             ]
-            if positions:
-                PositionRepository.save_all(positions)
-                logger.info(f"[Persist] Saved {len(positions)} position(s) to DB")
+            # Save even when empty: save_all deactivates old snapshots, so closing the last
+            # position must be persisted or it would be "recovered" on the next start.
+            PositionRepository.save_all(positions)
+            logger.info(f"[Persist] Saved {len(positions)} position(s) to DB")
         except Exception as exc:
             logger.warning(f"[Persist] Could not save positions: {exc}")
 

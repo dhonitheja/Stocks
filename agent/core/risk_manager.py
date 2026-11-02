@@ -4,13 +4,23 @@ Risk Management Engine
 Enforces all capital protection rules.
 A 30-year veteran never trades without stop-losses and position limits.
 """
+import json
+import math
+import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, date
+from pathlib import Path
 from typing import Dict, Optional, List
+import pytz
 from loguru import logger
 
-from agent.config import CONFIG
+from agent.config import CONFIG, LOGS_DIR
+
+# Exit reasons that may bypass the minimum-holding-time rule. Matched exactly (not by substring)
+# so an arbitrary reason string can never skip the rule.
+EXEMPT_EXIT_REASONS = frozenset({"stop_loss", "trailing_stop_loss", "emergency_stop"})
+DEFAULT_MAX_DRAWDOWN_PCT = 0.15
 
 
 @dataclass
@@ -76,20 +86,34 @@ class RiskManager:
     All trade decisions must pass through this before execution.
     """
 
-    def __init__(self):
+    def __init__(self, state_path: Optional[Path] = None):
         cfg = CONFIG["risk"]
+        # All limits come from config/settings.yaml [risk]; nothing here is hard-coded.
         self.total_fund = cfg["total_fund"]
-        self.max_position_pct = cfg["max_position_pct"]          # 0.02
-        self.max_sector_pct = cfg["max_sector_pct"]              # 0.20
-        self.min_cash_reserve_pct = cfg["min_cash_reserve_pct"]  # 0.30
-        self.max_daily_loss_pct = cfg["max_daily_loss_pct"]      # 0.03
-        self.max_trade_loss_pct = cfg["max_trade_loss_pct"]      # 0.015
-        self.trailing_stop_pct = cfg["trailing_stop_pct"]        # 0.008
-        self.min_confidence = cfg["min_confidence_score"]        # 0.72
-        self.max_open_positions = cfg["max_open_positions"]      # 10
-        self.min_holding_minutes = cfg["min_holding_minutes"]    # 5
+        self.max_position_pct = cfg["max_position_pct"]
+        self.max_sector_pct = cfg["max_sector_pct"]
+        self.min_cash_reserve_pct = cfg["min_cash_reserve_pct"]
+        self.max_daily_loss_pct = cfg["max_daily_loss_pct"]
+        self.max_trade_loss_pct = cfg["max_trade_loss_pct"]
+        self.trailing_stop_pct = cfg["trailing_stop_pct"]
+        self.min_confidence = cfg["min_confidence_score"]
+        self.max_open_positions = cfg["max_open_positions"]
+        self.min_holding_minutes = cfg["min_holding_minutes"]
         self.circuit_breaker_enabled = cfg["circuit_breaker_enabled"]
         self.blackout_events = cfg["news_blackout_events"]
+        self.max_drawdown_pct = cfg.get("max_drawdown_pct", DEFAULT_MAX_DRAWDOWN_PCT)
+        self._tz = pytz.timezone(CONFIG["market"]["timezone"])
+
+        # Overall (peak-to-trough) drawdown halt. Persisted so a restart cannot clear it.
+        self._state_path = Path(state_path) if state_path else Path(LOGS_DIR) / "risk_state.json"
+        self.peak_equity = self.total_fund
+        self.drawdown_halted = False
+        self.realized_pnl = 0.0            # cumulative across sessions; persisted
+        self.state_save_failed = False
+        self.state_missing = False   # True when no state file existed at startup
+        self._state_lock = threading.Lock()
+        self._last_marks: Dict[str, float] = {}
+        self._now = lambda: datetime.now(self._tz)   # injectable clock for tests
 
         self.positions: Dict[str, Position] = {}
         self.daily_pnl = 0.0
@@ -97,16 +121,24 @@ class RiskManager:
         self.emergency_stop = False
         self.news_blackout = False
         self._today_trades: List[dict] = []
-        self._last_reset_date = date.today()
+        self._last_reset_date = self._today()
         self._lock = threading.Lock()
+        self._load_state()
+        self.cash = self.total_fund + self.realized_pnl  # realized P&L from earlier sessions counts
+        if self.state_missing:
+            self._save_state()  # create it now so only the first start reports it missing
 
         logger.info(f"RiskManager initialized | Fund: ${self.total_fund:,.0f}")
 
     # ─── Daily Reset ─────────────────────────────────────────
 
+    def _today(self) -> date:
+        """Current date in the market timezone (US/Eastern), not the server's local time."""
+        return self._now().date()
+
     def _check_daily_reset(self):
         """Reset daily P&L counter at start of new trading day."""
-        today = date.today()
+        today = self._today()
         if today != self._last_reset_date:
             logger.info(f"📅 New trading day — resetting daily P&L (was ${self.daily_pnl:,.0f})")
             self.daily_pnl = 0.0
@@ -134,6 +166,12 @@ class RiskManager:
         # Emergency stop
         if self.emergency_stop:
             return False, "🔴 EMERGENCY STOP is active", 0
+
+        # Overall drawdown halt (cleared only by a human via reset_drawdown_halt)
+        if self.drawdown_halted:
+            return False, (
+                f"🔴 Max drawdown halt ({self.max_drawdown_pct:.0%} from peak) is active"
+            ), 0
 
         # News blackout
         if self.news_blackout:
@@ -188,7 +226,7 @@ class RiskManager:
 
         # Minimum holding time
         held_minutes = (datetime.now() - pos.entry_time).total_seconds() / 60
-        if held_minutes < self.min_holding_minutes and "stop_loss" not in reason:
+        if held_minutes < self.min_holding_minutes and reason not in EXEMPT_EXIT_REASONS:
             return False, f"Minimum hold time not reached ({held_minutes:.1f} min < {self.min_holding_minutes} min)"
 
         return True, f"✅ SELL approved for {symbol}"
@@ -230,6 +268,7 @@ class RiskManager:
                 return 0.0
             pos = self.positions.pop(symbol)
             pnl = pos.current_pnl(price)
+            self.realized_pnl += pnl
             self.daily_pnl += pnl
             self.cash += price * pos.quantity
             self._today_trades.append({
@@ -237,6 +276,7 @@ class RiskManager:
                 "qty": pos.quantity, "pnl": pnl, "reason": reason,
             })
 
+        self._save_state()
         pnl_pct = pos.current_pnl_pct(price) * 100
         emoji = "🟢" if pnl >= 0 else "🔴"
         logger.info(
@@ -277,6 +317,161 @@ class RiskManager:
                 exits.append((symbol, price, "target_reached"))
 
         return exits
+
+    # ─── Drawdown halt ────────────────────────────────────────
+
+    def equity(self, prices: Optional[Dict[str, float]] = None) -> float:
+        """
+        Cash plus open positions marked at `prices`. A missing price falls back to the last known
+        mark, then to entry price (with a warning), so a feed outage cannot silently hide a loss.
+        """
+        prices = prices or {}
+        with self._lock:
+            total = self.cash
+            for sym, p in self.positions.items():
+                px = prices.get(sym)
+                if px and px > 0:
+                    self._last_marks[sym] = px
+                else:
+                    px = self._last_marks.get(sym) or p.entry_price
+                    logger.warning(f"[Equity] No live price for {sym}; marking at ${px:.2f}")
+                total += p.quantity * px
+            return total
+
+    def check_drawdown(self, prices: Optional[Dict[str, float]] = None) -> bool:
+        """
+        Update peak equity and halt new buys when equity falls `max_drawdown_pct` below the peak.
+
+        Returns True if the halt is active. A halt survives restarts and is cleared only by
+        `reset_drawdown_halt()`, which is a deliberate human action.
+        """
+        eq = self.equity(prices)
+        changed = False
+        with self._lock:
+            if eq > self.peak_equity:
+                self.peak_equity = eq
+                changed = True
+            drawdown = (self.peak_equity - eq) / self.peak_equity if self.peak_equity > 0 else 0.0
+            if drawdown >= self.max_drawdown_pct and not self.drawdown_halted:
+                self.drawdown_halted = True
+                changed = True
+                logger.critical(
+                    f"🔴 MAX DRAWDOWN HALT | equity ${eq:,.2f} is {drawdown:.1%} below peak "
+                    f"${self.peak_equity:,.2f} (limit {self.max_drawdown_pct:.0%}). New buys blocked."
+                )
+        if changed:
+            self._save_state()
+        return self.drawdown_halted
+
+    def reset_drawdown_halt(self, new_peak: Optional[float] = None) -> None:
+        """Human-only: clear the drawdown halt and restart peak tracking from `new_peak`."""
+        if new_peak is not None and not (math.isfinite(new_peak) and new_peak > 0):
+            raise ValueError("new_peak must be a finite number greater than 0")
+        with self._lock:
+            self.drawdown_halted = False
+            self.peak_equity = new_peak if new_peak is not None else self.total_fund + self.realized_pnl
+        self._save_state()
+        logger.warning(f"Drawdown halt reset by operator | peak set to ${self.peak_equity:,.2f}")
+
+    def _save_state(self) -> bool:
+        """Atomically persist halt state. Serialized so concurrent threads cannot interleave."""
+        with self._state_lock:
+            with self._lock:
+                snapshot = {
+                    "peak_equity": self.peak_equity,
+                    "drawdown_halted": self.drawdown_halted,
+                    "realized_pnl": self.realized_pnl,
+                }
+            try:
+                self._state_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self._state_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(snapshot), encoding="utf-8")
+                os.replace(tmp, self._state_path)
+                self.state_save_failed = False
+                return True
+            except Exception as exc:  # OSError, or a non-serializable value
+                self.state_save_failed = True
+                logger.critical(
+                    f"RISK STATE NOT SAVED ({exc}); a restart may lose the drawdown halt / realized P&L"
+                )
+                return False
+
+    def _load_state(self) -> None:
+        if not self._state_path.exists():
+            self.state_missing = True
+            logger.warning(
+                f"No risk state at {self._state_path}; starting with a fresh peak and no halt. "
+                "If this is not a first run (e.g. ephemeral disk), a prior halt may have been lost."
+            )
+            return
+        try:
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("state is not an object")
+            peak = float(data["peak_equity"])
+            realized = float(data.get("realized_pnl", 0.0))
+            halted = bool(data.get("drawdown_halted", False))
+            if not (math.isfinite(peak) and peak > 0 and math.isfinite(realized)):
+                raise ValueError("non-finite or non-positive value")
+            self.peak_equity, self.realized_pnl, self.drawdown_halted = peak, realized, halted
+            if halted:
+                logger.critical("🔴 Max drawdown halt restored from previous session")
+        except Exception as exc:  # any unreadable state fails safe: halt rather than trade unguarded
+            self.drawdown_halted = True
+            logger.critical(f"Risk state unreadable ({exc}); halting new buys until an operator resets")
+
+    # ─── Broker reconciliation ────────────────────────────────
+
+    def reconcile_positions(self, broker_positions: List[dict]) -> dict:
+        """
+        Make tracked positions match the broker, which is the source of truth.
+
+        - tracked but not at the broker -> dropped (cash restored at cost)
+        - quantity differs              -> broker quantity wins
+        - at the broker but untracked   -> NOT adopted (may not belong to this agent); reported
+        Callers must pass a list from a call that verifiably succeeded (not one that swallowed an
+        error). An empty list while positions are tracked is refused and reported as `blocked_empty`.
+        """
+        held = {str(p["symbol"]).upper().strip(): p for p in broker_positions}
+        dropped, resized = [], []
+        with self._lock:
+            if not held and self.positions:
+                # An empty broker list while we track positions is far more likely a failed or
+                # partial call than a real flat book. Never wipe tracking on that evidence.
+                blocked = sorted(self.positions)
+                logger.critical(
+                    f"[Reconcile] Broker reports NO positions but {blocked} are tracked; "
+                    "refusing to drop them automatically. Verify at the broker."
+                )
+                return {"dropped": [], "resized": [], "untracked": [], "blocked_empty": blocked}
+            for sym in list(self.positions):
+                pos = self.positions[sym]
+                if sym not in held:
+                    self.cash += pos.cost_basis
+                    del self.positions[sym]
+                    dropped.append(sym)
+                    continue
+                broker_qty = float(held[sym]["qty"])
+                if abs(broker_qty - pos.quantity) > 1e-6:
+                    self.cash += (pos.quantity - broker_qty) * pos.entry_price
+                    pos.quantity = broker_qty
+                    resized.append(sym)
+            for sym, bp in held.items():  # broker marks, so a feed outage right after startup
+                px = bp.get("current_price")  # cannot hide a loss behind entry-price marking
+                if sym in self.positions and isinstance(px, (int, float)) and px > 0:
+                    self._last_marks[sym] = float(px)
+            untracked = sorted(s for s in held if s not in self.positions)
+        for sym in dropped:
+            logger.warning(f"[Reconcile] {sym} tracked locally but not held at broker; dropped")
+        for sym in resized:
+            logger.warning(f"[Reconcile] {sym} quantity adjusted to broker value")
+        if untracked:
+            logger.warning(f"[Reconcile] Broker holds untracked positions (not adopted): {untracked}")
+        return {"dropped": dropped, "resized": resized, "untracked": untracked, "blocked_empty": []}
+
+    def trading_allowed(self) -> bool:
+        """True when no halt is active. Re-check immediately before placing an order."""
+        return not (self.emergency_stop or self.drawdown_halted)
 
     # ─── Kill Switches ────────────────────────────────────────
 
@@ -325,6 +520,7 @@ class RiskManager:
 
         can_trade = (
             not self.emergency_stop
+            and not self.drawdown_halted
             and not self.news_blackout
             and total_pnl > -max_daily_loss
             and len(self.positions) < self.max_open_positions
@@ -345,6 +541,7 @@ class RiskManager:
             can_trade=can_trade,
             block_reason="" if can_trade else (
                 "Emergency stop" if self.emergency_stop else
+                "Max drawdown halt" if self.drawdown_halted else
                 "News blackout" if self.news_blackout else
                 "Daily loss limit hit"
             ),

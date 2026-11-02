@@ -244,6 +244,9 @@ def create_app() -> FastAPI:
         if _risk_manager is None:
             raise HTTPException(503, "Trading engine not running")
         _risk_manager.deactivate_emergency_stop()
+        if _risk_manager.drawdown_halted:
+            # Resume never clears the drawdown halt; that needs a deliberate operator reset.
+            return {"status": "EMERGENCY_STOP_CLEARED_BUT_DRAWDOWN_HALT_ACTIVE"}
         return {"status": "TRADING_RESUMED"}
 
     @app.post("/control/news-blackout")

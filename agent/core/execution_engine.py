@@ -220,23 +220,27 @@ class ExecutionEngine:
             logger.error(f"Failed to fetch account: {e}")
             return {}
 
-    def get_positions(self) -> List[Dict]:
-        """Get all open positions."""
+    def get_positions_strict(self) -> List[Dict]:
+        """Like get_positions() but raises on failure, so callers can tell "none" from "error"."""
         self._ensure_connected()
+        positions = self._trading_client.get_all_positions()
+        return [
+            {
+                "symbol": p.symbol,
+                "qty": float(p.qty),
+                "avg_entry": float(p.avg_entry_price),
+                "current_price": float(p.current_price),
+                "market_value": float(p.market_value),
+                "unrealized_pnl": float(p.unrealized_pl),
+                "unrealized_pnl_pct": float(p.unrealized_plpc) * 100,
+            }
+            for p in positions
+        ]
+
+    def get_positions(self) -> List[Dict]:
+        """Get all open positions (returns [] on error; use get_positions_strict to detect it)."""
         try:
-            positions = self._trading_client.get_all_positions()
-            return [
-                {
-                    "symbol": p.symbol,
-                    "qty": float(p.qty),
-                    "avg_entry": float(p.avg_entry_price),
-                    "current_price": float(p.current_price),
-                    "market_value": float(p.market_value),
-                    "unrealized_pnl": float(p.unrealized_pl),
-                    "unrealized_pnl_pct": float(p.unrealized_plpc) * 100,
-                }
-                for p in positions
-            ]
+            return self.get_positions_strict()
         except Exception as e:
             logger.error(f"Failed to fetch positions: {e}")
             return []
