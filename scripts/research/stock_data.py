@@ -88,8 +88,11 @@ def redact(msg):
 import hashlib
 import stat
 
-_STATE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "stock-agent")   # per-user, mode 0700
-_STATE_FILE = os.path.join(_STATE_DIR, "stock_data_state.json")
+_HOME = os.path.expanduser("~")
+# per-user, mode 0700. With no usable home (unset/empty HOME, "/") the shared state is disabled and
+# the in-process fallback is used instead of writing somewhere surprising such as /.cache.
+_STATE_DIR = os.path.join(_HOME, ".cache", "stock-agent") if os.path.isabs(_HOME) and _HOME != os.sep else None
+_STATE_FILE = os.path.join(_STATE_DIR, "stock_data_state.json") if _STATE_DIR else None
 _MAX_BYTES = 5_000_000  # refuse absurdly large responses
 _MAX_SLEEP = 65.0       # never sleep longer than this, whatever a state file says
 
@@ -122,6 +125,9 @@ def _open_state():
     """Open the shared state file safely, or return None (callers then use the in-process fallback).
     Refuses symlinks (file or directory), non-regular files, hardlinked files, files not owned by us
     or writable by others, and directories owned by others or left group/world accessible."""
+    if not _STATE_FILE:
+        _warn_state("no usable home directory")
+        return None
     try:
         d = os.path.dirname(_STATE_FILE)
         os.makedirs(d, mode=0o700, exist_ok=True)
@@ -162,23 +168,27 @@ def _with_state(fn):
             except OSError as e:               # e.g. ENOLCK on network filesystems
                 _warn_state(f"cannot lock state file: {e}")
                 return fn(_LOCAL_STATE)
-        raw = b""
-        while len(raw) < 1_000_000:           # an oversized file is treated as corrupt (reset below)
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            raw += chunk
         try:
-            state = json.loads(raw or b"{}")
-            if not isinstance(state, dict):
+            raw = b""
+            while len(raw) < 1_000_000:           # an oversized file is treated as corrupt (reset below)
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                raw += chunk
+            try:
+                state = json.loads(raw or b"{}")
+                if not isinstance(state, dict):
+                    state = {}
+            except ValueError:
                 state = {}
-        except ValueError:
-            state = {}
-        result = fn(state)
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.ftruncate(fd, 0)
-        os.write(fd, json.dumps(state).encode())   # tiny; a short write would just reset the state
-        return result
+            result = fn(state)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, json.dumps(state).encode())   # tiny; a short write would just reset the state
+            return result
+        except OSError as e:                 # disk full, I/O error, permission change mid-run
+            _warn_state(f"cannot use state file: {e}")
+            return fn(_LOCAL_STATE)
     finally:
         os.close(fd)  # closing releases the flock
 
@@ -197,26 +207,31 @@ class _TooLarge(Exception):
 
 def _polygon_wait():
     """Reserve the next Polygon slot (free plan: 5 calls/min). POLYGON_MIN_INTERVAL=0 on paid plans.
-    The wait is clamped, so a poisoned or stale state file can never hang the CLI."""
+
+    At most `depth` calls may be waiting (default 5, fewer if the interval is long enough that the
+    wait clamp would otherwise collapse slots): the 1 call that fires now plus `depth` waiting means
+    up to depth+1 callers in flight, and the next one gets a "queue full" error so run() can fall
+    back to another provider. The wait is clamped, so a poisoned state file can never hang the CLI."""
     gap = min(max(_num(os.environ.get("POLYGON_MIN_INTERVAL", "12.5"), 12.5), 0.0), 60.0)
     if gap <= 0:
         return 0.0
+    depth = max(1, min(5, int(_MAX_SLEEP // gap)))
 
     def reserve(state):
         now = time.time()
         nxt = _num(state.get("polygon_next"))
-        if nxt > now + 6 * gap + 1:              # impossible via normal use (max is now + 6*gap): corrupt
+        if nxt > now + (depth + 1) * gap + 1:    # impossible via normal use: corrupt or clock jump
             nxt = 0.0
         slot = max(now, nxt)
-        if slot - now > 5 * gap:                 # 5 calls already queued: do not stack a 6th on top
+        if slot - now > depth * gap:             # queue full: do not stack another on the same slot
             return None
         state["polygon_next"] = slot + gap
         return min(slot - now, _MAX_SLEEP)
 
     wait = _with_state(reserve)
     if wait is None:
-        raise RuntimeError("polygon: rate-limit queue full (5 calls already waiting); try later "
-                           "or use another provider")
+        raise RuntimeError(f"polygon: rate-limit queue full ({depth} calls already waiting); "
+                           "try later or use another provider")
     return wait
 
 
@@ -289,7 +304,7 @@ def http_json(url, params, _retry=True):
     if isinstance(d, dict):
         for k in ("Information", "Note", "Error Message"):
             if k in d:
-                raise RuntimeError(f"alphavantage: {d[k][:160]}")
+                raise RuntimeError(f"alphavantage: {str(d[k])[:160]}")
     return d
 
 

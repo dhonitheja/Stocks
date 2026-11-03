@@ -52,6 +52,8 @@ def _scrub_env_after(importer):
         dotenv_names = set(dotenv_values().keys())
     except Exception:
         dotenv_names = None          # cannot tell which names came from .env: fail closed below
+        print("repo_signals: could not read .env names; removing every environment variable the "
+              "import adds (except data-provider keys)", file=sys.stderr)
     before = set(os.environ)
     result = importer()
     for k in set(os.environ) - before:
