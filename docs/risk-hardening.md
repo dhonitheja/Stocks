@@ -23,6 +23,12 @@ that raises on failure, skips reconciliation if the broker is unreachable, and r
 broker shows no positions while some are tracked (alerts instead). Positions are also saved after every open and close (previously only on clean shutdown, and closing
 the last position was never saved).
 
+## Buys are re-checked at execution
+`analyze_all()` approves every BUY against the same pre-trade state, so earlier fills in a cycle are not reflected in
+the later approvals. `_execute_decision` therefore re-runs the full `can_buy` (open-position count, sector, cash
+reserve, daily loss, blackout, already held) right before each order, after the human-like delay, and sizes from that
+fresh answer, capped at the decision's own size.
+
 ## Reconciliation details
 A position the broker no longer holds is dropped and its loss/gain is **booked at the last known mark** (or the
 broker's price), so a stop that fired while the agent was down still counts toward the drawdown. Marks of open
@@ -31,8 +37,10 @@ restart. The booked price is the last mark before shutdown and the alert states 
 old. Marks are only kept for restored positions (`open_position(..., restored=True)` from DB recovery); a fresh buy
 never inherits an old mark, and the operator reset script keeps all saved marks. With no mark at all it is booked at cost and listed as
 `unbooked`: that loss is NOT recorded, so check the broker. Extra shares at the broker (for example a manual buy) are adopted at the broker's average cost with stop and target
-re-derived from it, and reported, because the agent's exit sells the whole position. A broker quantity of 0, a short
-(negative) or an unreadable value drops the local record and is reported loudly. The empty-broker safeguard ignores positions still inside the 3-minute grace window. Reconciliation also runs about every 5 minutes while the market is open,
+re-derived from it, and reported, because the agent's exit sells the whole position. A broker quantity of 0 or a short
+(negative) drops the local record and is reported loudly. An unreadable quantity (missing, NaN) leaves the local record
+untouched, so its stop keeps covering a position that may still exist, and is reported as `unreadable_qty`. Adopting
+extra shares never loosens a stop that has already trailed up. The empty-broker safeguard ignores positions still inside the 3-minute grace window. Reconciliation also runs about every 5 minutes while the market is open,
 skipping positions opened in the last 3 minutes (a just-accepted order may not show at the broker yet). Alerts fire
 only when the findings change.
 
@@ -52,7 +60,12 @@ not have blocked anything. `protect-env.ps1` stays as a second, Windows-only lay
 reads/edits of `.env`, `.env.*` (not `.env.example`), `*.pem`, `*.key` and secret config files, scripted
 `TRADING_MODE=live`, `--i-understand-the-risk`, force-push (not `--force-with-lease`) and destructive shell/SQL.
 It fails closed on its own errors. It is regex heuristics and can be bypassed by obfuscation; treat it as a
-guard rail, and use Claude Code's permission deny rules if you need enforcement. Commands are split on unquoted
+guard rail, and use Claude Code's permission deny rules if you need enforcement. The hook also protects itself: edits to `.claude/hooks/*` and `.claude/settings*.json` (through the Edit/Write tools or
+shell writes) are blocked, so changing the hook is a human edit. It blocks force-push in every spelling (`-fu`, `git -C`,
+`+refspec`; `--force-with-lease` is allowed), recursive searches over the project root without a `.env` exclusion
+(`grep -r X .`, `rg --hidden`), more `.env` readers (`tac`, `dd if=`, `curl -d @.env`, `git show HEAD:.env`), and
+environment-variable exposure (`printenv NAME_KEY`, `echo $X_SECRET`, `export`). `echo`/`printf` are not treated as
+message text, because they are how files get written. Commands are split on unquoted
 `&&`, `||`, `|`, `|&`, `&`, `;` and newlines (honoring quotes and escapes) and each segment is checked. Message text
 (commit/PR bodies, `echo`) is ignored only when the shell would not run it: a `$(cat <<'EOF' ... EOF)` body is
 skipped only for a quoted delimiter, up to the first delimiter line, with nothing but `)` after it; anything piped,
@@ -87,6 +100,12 @@ A position whose sell fails with "position does not exist" is cleared locally on
 The halt blocks new buys only (no liquidation, stops stay in place). It is evaluated every minute while the market is
 open, and again at startup and immediately before every buy.
 
+
+## Known hook limits
+A heredoc body that writes a file (`cat > f <<'EOF'`) is scanned as commands, and any piped command is scanned in full,
+so a few harmless commands that merely mention these words are blocked. Runtime string building
+(`a=risk; rm logs/${a}_state.json`, `base64 -d | sh`) and `cd logs && rm r*` are not caught: that is inherent to pattern
+matching, and why permission deny rules are recommended as the real boundary.
 
 ## Not done
 Money is still `float` (CLAUDE.md asks for `Decimal`/integer cents); stops are polled, not broker-side orders;

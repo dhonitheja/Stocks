@@ -174,11 +174,12 @@ class RiskManager:
     def _check_daily_reset(self):
         """Reset daily P&L counter at start of new trading day."""
         today = self._today()
-        if today != self._last_reset_date:
-            logger.info(f"📅 New trading day — resetting daily P&L (was ${self.daily_pnl:,.0f})")
-            self.daily_pnl = 0.0
-            self._today_trades = []
-            self._last_reset_date = today
+        with self._lock:     # daily_pnl is also mutated by close_position / reconcile on other threads
+            if today != self._last_reset_date:
+                logger.info(f"📅 New trading day — resetting daily P&L (was ${self.daily_pnl:,.0f})")
+                self.daily_pnl = 0.0
+                self._today_trades = []
+                self._last_reset_date = today
 
     # ─── Trade Approval ───────────────────────────────────────
 
@@ -255,10 +256,10 @@ class RiskManager:
 
     def can_sell(self, symbol: str, reason: str = "") -> tuple[bool, str]:
         """Check if SELL is allowed for a position."""
-        if symbol not in self.positions:
+        with self._lock:
+            pos = self.positions.get(symbol)
+        if pos is None:
             return False, f"{symbol} not in portfolio"
-
-        pos = self.positions[symbol]
 
         # Minimum holding time
         held_minutes = (datetime.now() - pos.entry_time).total_seconds() / 60
@@ -340,27 +341,28 @@ class RiskManager:
         Returns list of (symbol, price, reason) tuples for positions that hit stop-loss or target.
         """
         exits = []
-        for symbol, pos in list(self.positions.items()):
-            price = prices.get(symbol)
-            if not price:
-                continue
+        with self._lock:   # trailing-stop updates mutate positions that reconcile may rewrite
+            for symbol, pos in list(self.positions.items()):
+                price = prices.get(symbol)
+                if not price:
+                    continue
 
-            # Update trailing stop
-            if pos.update_trailing_stop(price):
-                logger.warning(f"🛑 TRAILING STOP hit for {symbol} @ ${price:.2f}")
-                exits.append((symbol, price, "trailing_stop_loss"))
-                continue
+                # Update trailing stop
+                if pos.update_trailing_stop(price):
+                    logger.warning(f"🛑 TRAILING STOP hit for {symbol} @ ${price:.2f}")
+                    exits.append((symbol, price, "trailing_stop_loss"))
+                    continue
 
-            # Static stop-loss
-            if pos.should_stop_loss(price):
-                logger.warning(f"🛑 STOP LOSS hit for {symbol} @ ${price:.2f} (SL: ${pos.stop_loss:.2f})")
-                exits.append((symbol, price, "stop_loss"))
-                continue
+                # Static stop-loss
+                if pos.should_stop_loss(price):
+                    logger.warning(f"🛑 STOP LOSS hit for {symbol} @ ${price:.2f} (SL: ${pos.stop_loss:.2f})")
+                    exits.append((symbol, price, "stop_loss"))
+                    continue
 
-            # Target hit
-            if price >= pos.target_price:
-                logger.info(f"🎯 TARGET hit for {symbol} @ ${price:.2f}")
-                exits.append((symbol, price, "target_reached"))
+                # Target hit
+                if price >= pos.target_price:
+                    logger.info(f"🎯 TARGET hit for {symbol} @ ${price:.2f}")
+                    exits.append((symbol, price, "target_reached"))
 
         return exits
 
@@ -520,9 +522,10 @@ class RiskManager:
         Callers must pass a list from a call that verifiably succeeded (not one that swallowed an
         error). An empty list while positions are tracked is refused and reported as `blocked_empty`.
         """
-        held = {str(p["symbol"]).upper().strip(): p for p in broker_positions}
+        held = {str(p["symbol"]).upper().strip(): p for p in broker_positions
+                if isinstance(p, dict) and p.get("symbol")}
         dropped, resized, unbooked, young = [], [], [], []
-        negative, adopted, booked_at = [], [], {}
+        negative, adopted, booked_at, unreadable = [], [], {}, []
         now = datetime.now()
         with self._lock:
             tracked = {k.upper().strip(): k for k in self.positions}
@@ -542,7 +545,7 @@ class RiskManager:
                     )
                 return {"dropped": [], "resized": [], "untracked": [], "blocked_empty": blocked,
                         "unbooked": [], "skipped_new": sorted(young), "negative_qty": [],
-                        "adopted_excess": [], "booked_at_mark_age_h": {}}
+                        "adopted_excess": [], "booked_at_mark_age_h": {}, "unreadable_qty": []}
             self._blocked_logged = ()
             for norm, key in list(tracked.items()):
                 pos = self.positions[key]
@@ -556,10 +559,18 @@ class RiskManager:
                 price = mark if mark else pos.entry_price
                 broker_qty = None
                 if norm in held:
+                    raw_qty = held[norm].get("qty")
                     try:
-                        broker_qty = float(held[norm].get("qty", 0) or 0)
+                        broker_qty = float(raw_qty)
+                        if not math.isfinite(broker_qty):
+                            raise ValueError("non-finite")
                     except (TypeError, ValueError):
-                        broker_qty = 0.0
+                        # We cannot tell what the broker holds: do NOT drop (the stop must keep
+                        # covering a position that may still exist). Report it loudly instead.
+                        unreadable.append(key)
+                        logger.critical(f"[Reconcile] Unreadable broker quantity for {key} ({raw_qty!r}); "
+                                        "leaving the local record untouched. Check the broker.")
+                        continue
                     if broker_qty < 0:
                         negative.append(key)
                         logger.critical(f"[Reconcile] Broker shows a SHORT ({broker_qty}) in {key}; "
@@ -597,9 +608,11 @@ class RiskManager:
                             avg = (pos.entry_price * pos.quantity + price * -delta) / broker_qty
                         self.cash -= (broker_qty * avg) - (pos.quantity * pos.entry_price)
                         pos.entry_price = avg
-                        pos.stop_loss = round(avg * (1 - self.max_trade_loss_pct), 4)
+                        # never loosen a stop that has already trailed up
+                        pos.stop_loss = max(pos.stop_loss,
+                                            round(avg * (1 - self.max_trade_loss_pct), 4))
                         pos.target_price = round(avg * (1 + self.max_trade_loss_pct * 2), 4)
-                        pos.highest_price = max(avg, price)
+                        pos.highest_price = max(pos.highest_price, avg, price)
                         adopted.append(key)
                     pos.quantity = broker_qty
                     resized.append(key)
@@ -631,7 +644,8 @@ class RiskManager:
                            "at broker average cost with new stop/target. The agent's exit sells them all.")
         return {"dropped": dropped, "resized": resized, "untracked": untracked,
                 "blocked_empty": [], "unbooked": unbooked, "skipped_new": sorted(young),
-                "negative_qty": negative, "adopted_excess": adopted, "booked_at_mark_age_h": booked_at}
+                "negative_qty": negative, "adopted_excess": adopted, "booked_at_mark_age_h": booked_at,
+                "unreadable_qty": unreadable}
 
     def trading_allowed(self) -> bool:
         """True when no halt is active. Re-check immediately before placing an order."""

@@ -199,28 +199,31 @@ class StockSageAgent:
                 logger.warning(f"BUY {decision.symbol} skipped: trading halted by risk layer")
                 return
 
-            # Calculate dollar amount to invest
-            dollar_amount = min(
-                self.cfg["risk"]["total_fund"] * self.cfg["risk"]["max_position_pct"],
-                self.risk_manager.cash - (self.cfg["risk"]["total_fund"] * self.cfg["risk"]["min_cash_reserve_pct"])
-            )
+            # Human-like delay (can last seconds; other fills and the monitor may change state)
+            self.decision_engine.apply_human_delay()
 
-            # Never exceed what can_buy approved (decision.quantity * price carries that amount).
+            if not self.risk_manager.trading_allowed():
+                logger.warning(f"BUY {decision.symbol} cancelled: trading halted during order delay")
+                return
+
+            # analyze_all() ran can_buy for EVERY symbol against the same pre-trade state, so earlier
+            # BUYs in this cycle are not reflected in those approvals. Re-run the full risk check
+            # now (open-position count, sector, cash reserve, daily loss, blackout, already held)
+            # and size from its answer.
+            allowed, why, approved = self.risk_manager.can_buy(
+                decision.symbol, decision.price, decision.confidence)
+            if not allowed:
+                logger.info(f"BUY {decision.symbol} vetoed at execution: {why}")
+                return
+            dollar_amount = approved
+            # decision.quantity carries the (variance-adjusted) size; never exceed the fresh approval
             q, px = getattr(decision, "quantity", 0), getattr(decision, "price", 0)
-            approved = q * px if isinstance(q, (int, float)) and isinstance(px, (int, float)) else 0
-            if approved > 0:
-                dollar_amount = min(dollar_amount, approved)
+            sized = q * px if isinstance(q, (int, float)) and isinstance(px, (int, float)) else 0
+            if sized > 0:
+                dollar_amount = min(dollar_amount, sized)
 
             if dollar_amount < 1.0:
                 logger.debug(f"Insufficient capital for {decision.symbol} buy")
-                return
-
-            # Human-like delay
-            self.decision_engine.apply_human_delay()
-
-            # The human-like delay above can last seconds; a halt may have tripped meanwhile.
-            if not self.risk_manager.trading_allowed():
-                logger.warning(f"BUY {decision.symbol} cancelled: trading halted during order delay")
                 return
 
             # Place order
@@ -325,7 +328,7 @@ class StockSageAgent:
                     broker_positions, grace_seconds=grace_seconds)
             sig = (tuple(result["dropped"]), tuple(result["resized"]), tuple(result["untracked"]),
                    tuple(result["blocked_empty"]), tuple(result.get("negative_qty", [])),
-                   tuple(result.get("adopted_excess", [])))
+                   tuple(result.get("adopted_excess", [])), tuple(result.get("unreadable_qty", [])))
             if any(sig) and sig != self._last_reconcile_sig:   # alert on change, not every cycle
                 msg = (
                     f"Reconciled with broker | dropped={result['dropped']} "
@@ -334,7 +337,8 @@ class StockSageAgent:
                     f"booked-at-cost(no mark, P&L NOT recorded)={result.get('unbooked', [])} "
                     f"booked-at-last-mark(age h)={result.get('booked_at_mark_age_h', {})} "
                     f"SHORT at broker={result.get('negative_qty', [])} "
-                    f"extra shares adopted={result.get('adopted_excess', [])}"
+                    f"extra shares adopted={result.get('adopted_excess', [])} "
+                    f"UNREADABLE qty (left untouched; check broker)={result.get('unreadable_qty', [])}"
                 )
                 console.print(f"[yellow]⚠️  {msg}[/yellow]")
                 logger.warning(msg)
