@@ -26,10 +26,13 @@ the last position was never saved).
 ## Reconciliation details
 A position the broker no longer holds is dropped and its loss/gain is **booked at the last known mark** (or the
 broker's price), so a stop that fired while the agent was down still counts toward the drawdown. Marks of open
-positions are saved in `logs/risk_state.json` about once a minute, so this also works after a restart (the booked
-price is the last mark before shutdown, which can be stale). With no mark at all it is booked at cost and listed as
-`unbooked`: that loss is NOT recorded, so check the broker. Extra shares at the broker are weight-averaged into the
-entry price. The empty-broker safeguard ignores positions still inside the 3-minute grace window. Reconciliation also runs about every 5 minutes while the market is open,
+positions (price and timestamp) are saved in `logs/risk_state.json` about once a minute, so this also works after a
+restart. The booked price is the last mark before shutdown and the alert states its age, because it can be hours
+old. Marks are only kept for restored positions (`open_position(..., restored=True)` from DB recovery); a fresh buy
+never inherits an old mark, and the operator reset script keeps all saved marks. With no mark at all it is booked at cost and listed as
+`unbooked`: that loss is NOT recorded, so check the broker. Extra shares at the broker (for example a manual buy) are adopted at the broker's average cost with stop and target
+re-derived from it, and reported, because the agent's exit sells the whole position. A broker quantity of 0, a short
+(negative) or an unreadable value drops the local record and is reported loudly. The empty-broker safeguard ignores positions still inside the 3-minute grace window. Reconciliation also runs about every 5 minutes while the market is open,
 skipping positions opened in the last 3 minutes (a just-accepted order may not show at the broker yet). Alerts fire
 only when the findings change.
 
@@ -49,7 +52,11 @@ not have blocked anything. `protect-env.ps1` stays as a second, Windows-only lay
 reads/edits of `.env`, `.env.*` (not `.env.example`), `*.pem`, `*.key` and secret config files, scripted
 `TRADING_MODE=live`, `--i-understand-the-risk`, force-push (not `--force-with-lease`) and destructive shell/SQL.
 It fails closed on its own errors. It is regex heuristics and can be bypassed by obfuscation; treat it as a
-guard rail, and use Claude Code's permission deny rules if you need enforcement. It also protects
+guard rail, and use Claude Code's permission deny rules if you need enforcement. Commands are split on unquoted
+`&&`, `||`, `|`, `|&`, `&`, `;` and newlines (honoring quotes and escapes) and each segment is checked. Message text
+(commit/PR bodies, `echo`) is ignored only when the shell would not run it: a `$(cat <<'EOF' ... EOF)` body is
+skipped only for a quoted delimiter, up to the first delimiter line, with nothing but `)` after it; anything piped,
+unquoted-heredoc, or containing `$(`/backticks is scanned in full. It also protects
 `logs/risk_state.json` (no edits, rm, mv or redirects) and blocks calls to `reset_drawdown_halt(`; the launcher fails
 closed if the guard crashes or no working Python is found. Known false positive:
 `grep "\.env"` is blocked.

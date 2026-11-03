@@ -113,9 +113,12 @@ class RiskManager:
         self.state_save_failed = False
         self.state_missing = False   # True when no state file existed at startup
         self._state_lock = threading.Lock()
+        # Last known prices, keyed by UPPER-CASE symbol (px and when it was seen).
         self._last_marks: Dict[str, float] = {}
+        self._mark_ts: Dict[str, float] = {}
         self._saved_marks: Dict[str, float] = {}
         self._mark_warned: set = set()
+        self._closed_at: Dict[str, float] = {}   # recently closed symbols (reconcile staleness)
         self._blocked_logged: tuple = ()
         self._now = lambda: datetime.now(self._tz)   # injectable clock for tests
 
@@ -135,6 +138,34 @@ class RiskManager:
         logger.info(f"RiskManager initialized | Fund: ${self.total_fund:,.0f}")
 
     # ─── Daily Reset ─────────────────────────────────────────
+
+    @staticmethod
+    def _mk(symbol: str) -> str:
+        return str(symbol).upper().strip()
+
+    def _set_mark(self, symbol: str, px: float) -> None:
+        k = self._mk(symbol)
+        self._last_marks[k] = float(px)
+        self._mark_ts[k] = time.time()
+
+    def _get_mark(self, symbol: str) -> Optional[float]:
+        return self._last_marks.get(self._mk(symbol))
+
+    def _drop_mark(self, symbol: str) -> None:
+        k = self._mk(symbol)
+        self._last_marks.pop(k, None)
+        self._mark_ts.pop(k, None)
+
+    def _tracked_upper(self) -> set:
+        return {self._mk(s) for s in self.positions}
+
+    def prune_marks(self) -> None:
+        """Drop saved marks for symbols that are not tracked (call after DB recovery)."""
+        with self._lock:
+            tracked = self._tracked_upper()
+            for k in [k for k in self._last_marks if k not in tracked]:
+                self._last_marks.pop(k, None)
+                self._mark_ts.pop(k, None)
 
     def _today(self) -> date:
         """Current date in the market timezone (US/Eastern), not the server's local time."""
@@ -167,59 +198,60 @@ class RiskManager:
         """
         self._check_daily_reset()
 
-        # Emergency stop
-        if self.emergency_stop:
-            return False, "🔴 EMERGENCY STOP is active", 0
+        with self._lock:   # positions are mutated by the monitor thread (reconcile/exits)
+            # Emergency stop
+            if self.emergency_stop:
+                return False, "🔴 EMERGENCY STOP is active", 0
 
-        # Overall drawdown halt (cleared only by a human via reset_drawdown_halt)
-        if self.drawdown_halted:
-            return False, (
-                f"🔴 Max drawdown halt ({self.max_drawdown_pct:.0%} from peak) is active"
-            ), 0
+            # Overall drawdown halt (cleared only by a human via reset_drawdown_halt)
+            if self.drawdown_halted:
+                return False, (
+                    f"🔴 Max drawdown halt ({self.max_drawdown_pct:.0%} from peak) is active"
+                ), 0
 
-        # News blackout
-        if self.news_blackout:
-            return False, "📰 News blackout mode active — waiting for clarity", 0
+            # News blackout
+            if self.news_blackout:
+                return False, "📰 News blackout mode active — waiting for clarity", 0
 
-        # Confidence threshold
-        if confidence < self.min_confidence:
-            return False, f"Confidence {confidence:.0%} < minimum {self.min_confidence:.0%}", 0
+            # Confidence threshold
+            if confidence < self.min_confidence:
+                return False, f"Confidence {confidence:.0%} < minimum {self.min_confidence:.0%}", 0
 
-        # Already holding this stock
-        if symbol in self.positions:
-            return False, f"Already holding {symbol}", 0
+            # Already holding this stock
+            if symbol in self.positions:
+                return False, f"Already holding {symbol}", 0
 
-        # Max open positions
-        if len(self.positions) >= self.max_open_positions:
-            return False, f"Max open positions ({self.max_open_positions}) reached", 0
+            # Max open positions
+            if len(self.positions) >= self.max_open_positions:
+                return False, f"Max open positions ({self.max_open_positions}) reached", 0
 
-        # Daily loss circuit breaker
-        max_daily_loss = self.total_fund * self.max_daily_loss_pct
-        if self.daily_pnl <= -max_daily_loss and self.circuit_breaker_enabled:
-            return False, f"🟡 Daily loss limit hit (${self.daily_pnl:,.0f}). Trading paused.", 0
+            # Daily loss circuit breaker
+            max_daily_loss = self.total_fund * self.max_daily_loss_pct
+            if self.daily_pnl <= -max_daily_loss and self.circuit_breaker_enabled:
+                return False, f"🟡 Daily loss limit hit (${self.daily_pnl:,.0f}). Trading paused.", 0
 
-        # Cash reserve check
-        min_cash = self.total_fund * self.min_cash_reserve_pct
-        if self.cash <= min_cash:
-            return False, f"Cash below reserve minimum (${min_cash:,.0f})", 0
+            # Cash reserve check
+            min_cash = self.total_fund * self.min_cash_reserve_pct
+            if self.cash <= min_cash:
+                return False, f"Cash below reserve minimum (${min_cash:,.0f})", 0
 
-        # Sector concentration check
-        sector_invested = sum(
-            p.cost_basis for p in self.positions.values()
-            if p.sector == sector
-        )
-        max_sector = self.total_fund * self.max_sector_pct
-        if sector_invested >= max_sector:
-            return False, f"Sector '{sector}' already at max ({self.max_sector_pct:.0%})", 0
+            # Sector concentration check
+            sector_invested = sum(
+                p.cost_basis for p in self.positions.values()
+                if p.sector == sector
+            )
+            max_sector = self.total_fund * self.max_sector_pct
+            if sector_invested >= max_sector:
+                return False, f"Sector '{sector}' already at max ({self.max_sector_pct:.0%})", 0
 
-        # Compute position size (dollar-based; supports fractional shares)
-        max_per_trade = self.total_fund * self.max_position_pct
-        dollar_amount = min(self.cash - min_cash, max_per_trade)
+            # Compute position size (dollar-based; supports fractional shares)
+            max_per_trade = self.total_fund * self.max_position_pct
+            dollar_amount = min(self.cash - min_cash, max_per_trade)
 
-        if dollar_amount < 1.0:
-            return False, f"Available capital ${dollar_amount:.2f} < $1 minimum", 0.0
+            if dollar_amount < 1.0:
+                return False, f"Available capital ${dollar_amount:.2f} < $1 minimum", 0.0
 
-        return True, f"✅ BUY approved — ${dollar_amount:.2f} @ ${price:.2f}", dollar_amount
+            return True, f"✅ BUY approved — ${dollar_amount:.2f} @ ${price:.2f}", dollar_amount
 
     def can_sell(self, symbol: str, reason: str = "") -> tuple[bool, str]:
         """Check if SELL is allowed for a position."""
@@ -237,8 +269,13 @@ class RiskManager:
 
     # ─── Position Management ──────────────────────────────────
 
-    def open_position(self, symbol: str, price: float, quantity: float, sector: str = "General"):
-        """Record a new position after successful buy order."""
+    def open_position(self, symbol: str, price: float, quantity: float, sector: str = "General",
+                      restored: bool = False):
+        """Record a new position after a successful buy order.
+
+        restored=True is for positions recovered from the DB at startup: their saved mark is kept
+        so a cold-start reconcile can book a loss taken while the agent was down. A fresh buy
+        never inherits an old mark."""
         stop_loss_price = price * (1 - self.max_trade_loss_pct)
         target_price = price * (1 + self.max_trade_loss_pct * 2)  # 2:1 reward/risk
 
@@ -256,6 +293,8 @@ class RiskManager:
         with self._lock:
             self.positions[symbol] = pos
             self._mark_warned.discard(symbol)
+            if not restored:
+                self._drop_mark(symbol)
             self.cash -= price * quantity
 
         logger.info(
@@ -272,7 +311,8 @@ class RiskManager:
             if symbol not in self.positions:
                 return 0.0
             pos = self.positions.pop(symbol)
-            self._last_marks.pop(symbol, None)
+            self._drop_mark(symbol)
+            self._closed_at[self._mk(symbol)] = time.time()
             pnl = pos.current_pnl(price)
             self.realized_pnl += pnl
             self.daily_pnl += pnl
@@ -335,11 +375,11 @@ class RiskManager:
         with self._lock:
             total = self.cash
             for sym, p in self.positions.items():
-                px = prices.get(sym)
+                px = prices.get(sym) or prices.get(self._mk(sym))
                 if px and px > 0:
-                    self._last_marks[sym] = px
+                    self._set_mark(sym, px)
                 else:
-                    px = self._last_marks.get(sym) or p.entry_price
+                    px = self._get_mark(sym) or p.entry_price
                     if sym not in self._mark_warned:     # once per symbol, not every minute
                         self._mark_warned.add(sym)
                         logger.error(f"[Equity] No live price for {sym}; marking at ${px:.2f}. "
@@ -369,10 +409,9 @@ class RiskManager:
                     f"${self.peak_equity:,.2f} (limit {self.max_drawdown_pct:.0%}). New buys blocked."
                 )
         with self._lock:
-            marks_moved = any(
-                abs(self._last_marks.get(k, 0) - self._saved_marks.get(k, 0)) >= 0.01
-                for k in self._last_marks
-            ) or set(self._saved_marks) - set(self._last_marks) != set()
+            current = self._persistable_marks()
+            marks_moved = set(current) != set(self._saved_marks) or any(
+                abs(current[k]["px"] - self._saved_marks.get(k, 0)) >= 0.01 for k in current)
         if changed or marks_moved:
             self._save_state()
         return self.drawdown_halted
@@ -384,28 +423,35 @@ class RiskManager:
         with self._lock:
             self.drawdown_halted = False
             self.peak_equity = new_peak if new_peak is not None else self.total_fund + self.realized_pnl
-        self._save_state()
+        # A standalone process (the reset script) tracks no positions; keep every saved mark.
+        self._save_state(keep_all_marks=True)
         logger.warning(f"Drawdown halt reset by operator | peak set to ${self.peak_equity:,.2f}")
 
-    def _save_state(self) -> bool:
+    def _persistable_marks(self, keep_all: bool = False) -> dict:
+        """Marks to save (caller holds _lock): open positions only, unless keep_all."""
+        keys = self._last_marks if keep_all else self._tracked_upper()
+        return {k: {"px": self._last_marks[k], "ts": self._mark_ts.get(k, 0.0)}
+                for k in keys if k in self._last_marks}
+
+    def _save_state(self, keep_all_marks: bool = False) -> bool:
         """Atomically persist halt state. Serialized so concurrent threads cannot interleave."""
         with self._state_lock:
             with self._lock:
+                marks = self._persistable_marks(keep_all=keep_all_marks)
                 snapshot = {
                     "peak_equity": self.peak_equity,
                     "drawdown_halted": self.drawdown_halted,
                     "realized_pnl": self.realized_pnl,
-                    # marks of open positions only, so a cold start can book down-time losses and
-                    # a re-bought symbol never inherits an old trade's mark
-                    "marks": {k: v for k, v in self._last_marks.items() if k in self.positions},
+                    # marks of open positions: lets a cold start book down-time losses
+                    "marks": marks,
                 }
-                self._saved_marks = dict(snapshot["marks"])
             try:
                 self._state_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self._state_path.with_suffix(".tmp")
                 tmp.write_text(json.dumps(snapshot), encoding="utf-8")
                 os.replace(tmp, self._state_path)
                 self.state_save_failed = False
+                self._saved_marks = {k: v["px"] for k, v in marks.items()}   # only after success
                 return True
             except Exception as exc:  # OSError, or a non-serializable value
                 self.state_save_failed = True
@@ -434,10 +480,13 @@ class RiskManager:
             self.peak_equity, self.realized_pnl, self.drawdown_halted = peak, realized, halted
             marks = data.get("marks", {})
             if isinstance(marks, dict):
-                self._last_marks = {
-                    str(k): float(v) for k, v in marks.items()
-                    if isinstance(v, (int, float)) and math.isfinite(v) and v > 0
-                }
+                for k, v in marks.items():
+                    px, ts = (v.get("px"), v.get("ts", 0.0)) if isinstance(v, dict) else (v, 0.0)
+                    if isinstance(px, (int, float)) and not isinstance(px, bool) \
+                            and math.isfinite(px) and px > 0:
+                        key = self._mk(k)
+                        self._last_marks[key] = float(px)
+                        self._mark_ts[key] = float(ts) if isinstance(ts, (int, float)) else 0.0
                 self._saved_marks = dict(self._last_marks)
             if halted:
                 logger.critical("🔴 Max drawdown halt restored from previous session")
@@ -473,6 +522,7 @@ class RiskManager:
         """
         held = {str(p["symbol"]).upper().strip(): p for p in broker_positions}
         dropped, resized, unbooked, young = [], [], [], []
+        negative, adopted, booked_at = [], [], {}
         now = datetime.now()
         with self._lock:
             tracked = {k.upper().strip(): k for k in self.positions}
@@ -491,48 +541,81 @@ class RiskManager:
                         "refusing to drop them automatically. Verify at the broker."
                     )
                 return {"dropped": [], "resized": [], "untracked": [], "blocked_empty": blocked,
-                        "unbooked": [], "skipped_new": sorted(young)}
+                        "unbooked": [], "skipped_new": sorted(young), "negative_qty": [],
+                        "adopted_excess": [], "booked_at_mark_age_h": {}}
             self._blocked_logged = ()
             for norm, key in list(tracked.items()):
                 pos = self.positions[key]
                 if key in young:
                     continue
-                mark = self._last_marks.get(norm) or self._last_marks.get(key)
+                mark = self._last_marks.get(norm)
+                mark_age_h = (time.time() - self._mark_ts.get(norm, 0.0)) / 3600 if mark else None
                 bp = held.get(norm, {}).get("current_price")
                 if isinstance(bp, (int, float)) and bp > 0:
-                    mark = float(bp)
+                    mark, mark_age_h = float(bp), 0.0
                 price = mark if mark else pos.entry_price
-                if norm not in held:
+                broker_qty = None
+                if norm in held:
+                    try:
+                        broker_qty = float(held[norm].get("qty", 0) or 0)
+                    except (TypeError, ValueError):
+                        broker_qty = 0.0
+                    if broker_qty < 0:
+                        negative.append(key)
+                        logger.critical(f"[Reconcile] Broker shows a SHORT ({broker_qty}) in {key}; "
+                                        "this agent never shorts. Dropping local record; check the account.")
+                if norm not in held or broker_qty is None or broker_qty <= 0:
                     pnl = (price - pos.entry_price) * pos.quantity
                     self.realized_pnl += pnl
                     self.daily_pnl += pnl
                     self.cash += price * pos.quantity
                     del self.positions[key]
-                    self._last_marks.pop(key, None)
                     self._last_marks.pop(norm, None)
+                    self._mark_ts.pop(norm, None)
                     dropped.append(key)
                     if not mark:
                         unbooked.append(key)
+                    else:
+                        booked_at[key] = round(mark_age_h or 0.0, 2)
                     continue
-                broker_qty = float(held[norm]["qty"])
                 if abs(broker_qty - pos.quantity) > 1e-6:
                     delta = pos.quantity - broker_qty
                     if delta > 0:                 # shares left without us: book at the mark
                         pnl = (price - pos.entry_price) * delta
                         self.realized_pnl += pnl
                         self.daily_pnl += pnl
-                    elif broker_qty > 0:          # extra shares: weighted-average the entry price
-                        pos.entry_price = (pos.entry_price * pos.quantity + price * -delta) / broker_qty
-                    self.cash += delta * price
+                        self.cash += delta * price
+                        if not mark:
+                            unbooked.append(key)
+                    else:
+                        # Extra shares (e.g. a manual buy). The agent's full-position exit would sell
+                        # them anyway, so adopt them explicitly at the broker's average cost and
+                        # re-derive stop/target from it; report it so a human can object.
+                        avg = held[norm].get("avg_entry")
+                        avg = float(avg) if isinstance(avg, (int, float)) and avg > 0 else None
+                        if avg is None:
+                            avg = (pos.entry_price * pos.quantity + price * -delta) / broker_qty
+                        self.cash -= (broker_qty * avg) - (pos.quantity * pos.entry_price)
+                        pos.entry_price = avg
+                        pos.stop_loss = round(avg * (1 - self.max_trade_loss_pct), 4)
+                        pos.target_price = round(avg * (1 + self.max_trade_loss_pct * 2), 4)
+                        pos.highest_price = max(avg, price)
+                        adopted.append(key)
                     pos.quantity = broker_qty
                     resized.append(key)
-                    if not mark:
-                        unbooked.append(key)
+            tracked_now = self._tracked_upper()
             for norm, bp in held.items():  # broker marks, so a feed outage right after startup
                 px = bp.get("current_price")  # cannot hide a loss behind entry-price marking
-                if norm in tracked and isinstance(px, (int, float)) and px > 0:
-                    self._last_marks[norm] = float(px)
-            untracked = sorted(s for s in held if s not in tracked)
+                if norm in tracked_now and isinstance(px, (int, float)) and px > 0:
+                    self._set_mark(norm, px)
+            now_ts = time.time()
+            window = max(grace_seconds, 0.0)
+            # A symbol we closed moments ago may still show in a broker snapshot taken before the
+            # sell completed; do not call it "untracked".
+            untracked = sorted(
+                s for s in held
+                if s not in tracked and not (window and now_ts - self._closed_at.get(s, 0) < window)
+            )
         for sym in dropped:
             logger.warning(f"[Reconcile] {sym} tracked locally but not held at broker; dropped and booked")
         for sym in resized:
@@ -543,8 +626,12 @@ class RiskManager:
             logger.warning(f"[Reconcile] Broker holds untracked positions (not adopted): {untracked}")
         if dropped or resized:
             self._save_state()
+        if adopted:
+            logger.warning(f"[Reconcile] Broker holds MORE shares than tracked for {adopted}; adopted "
+                           "at broker average cost with new stop/target. The agent's exit sells them all.")
         return {"dropped": dropped, "resized": resized, "untracked": untracked,
-                "blocked_empty": [], "unbooked": unbooked, "skipped_new": sorted(young)}
+                "blocked_empty": [], "unbooked": unbooked, "skipped_new": sorted(young),
+                "negative_qty": negative, "adopted_excess": adopted, "booked_at_mark_age_h": booked_at}
 
     def trading_allowed(self) -> bool:
         """True when no halt is active. Re-check immediately before placing an order."""
@@ -576,10 +663,12 @@ class RiskManager:
         self._check_daily_reset()
         current_prices = current_prices or {}
 
-        invested = sum(p.cost_basis for p in self.positions.values())
+        with self._lock:
+            positions = dict(self.positions)
+        invested = sum(p.cost_basis for p in positions.values())
         unrealized_pnl = sum(
             p.current_pnl(current_prices.get(s, p.entry_price))
-            for s, p in self.positions.items()
+            for s, p in positions.items()
         )
         total_pnl = self.daily_pnl + unrealized_pnl
         total_pnl_pct = total_pnl / self.total_fund

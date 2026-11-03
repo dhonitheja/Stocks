@@ -103,6 +103,7 @@ class StockSageAgent:
 
         # Restore open positions from last session
         self._recover_positions()
+        self.risk_manager.prune_marks()   # forget saved marks of symbols that were not restored
         self._reconcile_with_broker()
         self._check_drawdown()   # evaluate before any trading, not after the first monitor tick
         if self.risk_manager.state_missing:
@@ -204,6 +205,12 @@ class StockSageAgent:
                 self.risk_manager.cash - (self.cfg["risk"]["total_fund"] * self.cfg["risk"]["min_cash_reserve_pct"])
             )
 
+            # Never exceed what can_buy approved (decision.quantity * price carries that amount).
+            q, px = getattr(decision, "quantity", 0), getattr(decision, "price", 0)
+            approved = q * px if isinstance(q, (int, float)) and isinstance(px, (int, float)) else 0
+            if approved > 0:
+                dollar_amount = min(dollar_amount, approved)
+
             if dollar_amount < 1.0:
                 logger.debug(f"Insufficient capital for {decision.symbol} buy")
                 return
@@ -293,6 +300,7 @@ class StockSageAgent:
                     symbol=snap.symbol,
                     price=snap.entry_price,
                     quantity=snap.quantity,
+                    restored=True,          # keep its saved mark for cold-start booking
                 )
                 logger.info(
                     f"[Recovery] Restored {snap.symbol}: {snap.quantity} shares "
@@ -316,13 +324,17 @@ class StockSageAgent:
                 result = self.risk_manager.reconcile_positions(
                     broker_positions, grace_seconds=grace_seconds)
             sig = (tuple(result["dropped"]), tuple(result["resized"]), tuple(result["untracked"]),
-                   tuple(result["blocked_empty"]))
+                   tuple(result["blocked_empty"]), tuple(result.get("negative_qty", [])),
+                   tuple(result.get("adopted_excess", [])))
             if any(sig) and sig != self._last_reconcile_sig:   # alert on change, not every cycle
                 msg = (
                     f"Reconciled with broker | dropped={result['dropped']} "
                     f"resized={result['resized']} untracked(not adopted)={result['untracked']} "
                     f"NOT dropped (broker showed none; verify manually)={result['blocked_empty']} "
-                    f"booked-at-cost(no mark)={result.get('unbooked', [])}"
+                    f"booked-at-cost(no mark, P&L NOT recorded)={result.get('unbooked', [])} "
+                    f"booked-at-last-mark(age h)={result.get('booked_at_mark_age_h', {})} "
+                    f"SHORT at broker={result.get('negative_qty', [])} "
+                    f"extra shares adopted={result.get('adopted_excess', [])}"
                 )
                 console.print(f"[yellow]⚠️  {msg}[/yellow]")
                 logger.warning(msg)

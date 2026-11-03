@@ -761,8 +761,8 @@ class TestColdStartBooking:
         a.open_position("MSFT", 10.0, 1.0)
         a.check_drawdown({"AAPL": 6.0, "MSFT": 10.0})        # marks persisted by the minute check
         b = RiskManager(state_path=path)                     # agent restarts; AAPL was stopped out
-        b.open_position("AAPL", 10.0, 5.0)                   # DB recovery
-        b.open_position("MSFT", 10.0, 1.0)
+        b.open_position("AAPL", 10.0, 5.0, restored=True)    # DB recovery keeps saved marks
+        b.open_position("MSFT", 10.0, 1.0, restored=True)
         out = b.reconcile_positions([{"symbol": "MSFT", "qty": 1.0}])   # cold start: no live marks
         assert out["dropped"] == ["AAPL"] and out["unbooked"] == []
         assert b.realized_pnl == pytest.approx(-20.0)
@@ -773,7 +773,8 @@ class TestColdStartBooking:
         a = RiskManager(state_path=path)
         a.open_position("AAPL", 10.0, 5.0)
         a.check_drawdown({"AAPL": 7.25})
-        assert json.loads(path.read_text())["marks"]["AAPL"] == pytest.approx(7.25)
+        saved = json.loads(path.read_text())["marks"]["AAPL"]
+        assert saved["px"] == pytest.approx(7.25) and saved["ts"] > 0
 
     def test_junk_marks_in_state_file_are_ignored_not_fatal(self, tmp_path):
         from agent.core.risk_manager import RiskManager
@@ -875,3 +876,457 @@ class TestHookRound4:
     def test_still_blocks(self, tool, args):
         r = run_guard(tool, **args)
         assert r.returncode == 2, (tool, args, r.stdout, r.stderr)
+
+
+
+# ═══ review round 5 ═════════════════════════════════════════════════════════
+# Probe commands from the round-5 review (bypasses must block; legitimate work must pass).
+
+ROUND5_BLOCK = [
+    [
+        "baseline live",
+        "TRADING_MODE=live python -m agent.main"
+    ],
+    [
+        "baseline bash -c",
+        "bash -c 'TRADING_MODE=live python -m agent.main --i-understand-the-risk'"
+    ],
+    [
+        "echo | bash",
+        "echo 'TRADING_MODE=live python -m agent.main --i-understand-the-risk' | bash"
+    ],
+    [
+        "echo & bash -c",
+        "echo hi & bash -c 'TRADING_MODE=live python -m agent.main --i-understand-the-risk'"
+    ],
+    [
+        "echo $(bash -c)",
+        "echo $(bash -c 'TRADING_MODE=live python -m agent.main --i-understand-the-risk')"
+    ],
+    [
+        "echo backslash-dq ; bash",
+        "echo \\\"; bash -c 'TRADING_MODE=live python -m agent.main --i-understand-the-risk'"
+    ],
+    [
+        "echo \"a\\\\\" ; bash",
+        "echo \"a\\\\\" ; bash -c 'TRADING_MODE=live python -m agent.main --i-understand-the-risk'"
+    ],
+    [
+        "git commit unquoted heredoc subst",
+        "git commit -m \"$(cat <<EOF\n$(bash -c 'TRADING_MODE=live python -m agent.main --i-understand-the-risk')\nEOF\n)\""
+    ],
+    [
+        "echo | python risk_state",
+        "echo 'import json;json.dump({},open(\"logs/risk_state.json\",\"w\"))' | python"
+    ],
+    [
+        "python os.remove risk_state",
+        "python -c \"import os; os.remove('logs/risk_state.json')\""
+    ],
+    [
+        "python Path.unlink",
+        "python -c \"from pathlib import Path; Path('logs/risk_state.json').unlink()\""
+    ],
+    [
+        "python os.rename",
+        "python -c \"import os; os.rename('/tmp/x.json','logs/risk_state.json')\""
+    ],
+    [
+        "rm -rf logs",
+        "rm -rf logs"
+    ],
+    [
+        "find -delete",
+        "find logs -name 'risk_state*' -delete"
+    ],
+    [
+        "git clean logs",
+        "git clean -fdx logs"
+    ],
+    [
+        "rm risk_state baseline",
+        "rm logs/risk_state.json"
+    ],
+    [
+        "redirect baseline",
+        "echo {} > logs/risk_state.json"
+    ],
+    [
+        "secret baseline",
+        "cat config/api_keys.json"
+    ],
+    [
+        "secret glob",
+        "cat config/api_k?ys.json"
+    ],
+    [
+        "secret brace",
+        "cat config/api_key{s,}.json"
+    ],
+    [
+        "secret jq",
+        "jq . config/api_keys.json"
+    ],
+    [
+        "secret sudo cat",
+        "sudo cat config/api_keys.json"
+    ],
+    [
+        "secret python open",
+        "python -c \"print(open('config/api_keys.json').read())\""
+    ],
+    [
+        "aws credentials",
+        "cat ~/.aws/credentials"
+    ],
+    [
+        "ssh key",
+        "cat ~/.ssh/id_ed25519"
+    ],
+    [
+        "secret unbalanced quote",
+        "cat \"config/api_keys.json"
+    ],
+    [
+        "env glob",
+        "cat .en?"
+    ],
+    [
+        "env baseline",
+        "cat .env"
+    ],
+    [
+        "backslash-newline",
+        "bash -c \\\n'TRADING_MODE=live python -m agent.main'"
+    ],
+    [
+        "echo in single |",
+        "printf '%s\\n' 'TRADING_MODE=live' | xargs -I{} env {} python -m agent.main"
+    ],
+    [
+        "quoted heredoc, cmd after first EOF",
+        "git commit -m \"$(cat <<'EOF'\nfix: msg\nEOF\nbash -c 'TRADING_MODE=live python -m agent.main --i-understand-the-risk'\nEOF\n)\""
+    ],
+    [
+        "quoted heredoc, rm after EOF",
+        "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\nrm logs/risk_state.json\nEOF\n)\""
+    ]
+]
+
+ROUND5_ALLOW = [
+    [
+        "git commit quoted heredoc (legit)",
+        "git commit -m \"$(cat <<'EOF'\nfix: do not set TRADING_MODE=live; rm logs/risk_state.json is blocked\n\nCo-Authored-By: x\nEOF\n)\""
+    ],
+    [
+        "git commit heredoc w/ dquote (legit)",
+        "git commit -m \"$(cat <<'EOF'\nfix: the \"rm logs/risk_state.json\" rule\nTRADING_MODE=live is human-only\nEOF\n)\""
+    ],
+    [
+        "git commit -F heredoc (legit)",
+        "git commit -F - <<'EOF'\nfix: block rm of risk_state.json\nEOF"
+    ],
+    [
+        "FP 2>&1",
+        "python -m pytest -q 2>&1 | grep risk_state.json"
+    ],
+    [
+        "FP grep write_text && cat state",
+        "grep -n write_text agent/core/risk_manager.py && cat logs/risk_state.json"
+    ],
+    [
+        "FP grep risk_state && grep os.replace",
+        "grep -rn risk_state agent/ ; grep -rn os.replace agent/"
+    ],
+    [
+        "FP cp backup risk_state",
+        "cp logs/risk_state.json /tmp/backup.json"
+    ],
+    [
+        "FP grep api_key identifier",
+        "grep -rn api_key agent/"
+    ],
+    [
+        "FP grep SECRET_KEY",
+        "grep -rn ALPACA_SECRET_KEY agent/ config/"
+    ],
+    [
+        "FP cat secrets_helper.py",
+        "cat agent/secrets_helper.py"
+    ],
+    [
+        "reset script direct",
+        "python scripts/reset_drawdown_halt.py --new-peak 1000"
+    ],
+    [
+        "gh pr body legit",
+        "gh pr create --title 'x' --body 'Blocks TRADING_MODE=live and rm logs/risk_state.json'"
+    ]
+]
+
+
+class TestHookRound5Probes:
+    @pytest.mark.parametrize("name,cmd", ROUND5_BLOCK, ids=[n for n, _ in ROUND5_BLOCK])
+    def test_bypasses_are_blocked(self, name, cmd):
+        r = run_guard("Bash", command=cmd)
+        assert r.returncode == 2, (name, cmd, r.stderr)
+
+    @pytest.mark.parametrize("name,cmd", ROUND5_ALLOW, ids=[n for n, _ in ROUND5_ALLOW])
+    def test_legitimate_work_is_allowed(self, name, cmd):
+        r = run_guard("Bash", command=cmd)
+        assert r.returncode == 0, (name, cmd, r.stderr)
+
+    @pytest.mark.parametrize("cmd", [
+        "git commit -m \"$(cat <<'EOF'\nmsg\nEOF   \n)\"",                 # trailing spaces on EOF
+        "git commit -m \"$(cat <<\"EOF\"\nmentions reset_drawdown_halt()\nEOF\n)\"",
+        "cat logs/risk_state.json > /tmp/backup.json",
+        "find . -name '*.pyc' -delete",
+        "git clean -fd",
+        "rm -rf build dist",
+        "jq .peak_equity logs/risk_state.json",
+    ])
+    def test_more_legitimate_commands(self, cmd):
+        r = run_guard("Bash", command=cmd)
+        assert r.returncode == 0, (cmd, r.stderr)
+
+    @pytest.mark.parametrize("cmd", [
+        "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\" ; rm logs/risk_state.json",
+        "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\" && TRADING_MODE=live python x.py",
+        "git commit -F - <<EOF\n$(cat .env)\nEOF",                             # unquoted: expands
+        "cat ~/.netrc",
+        "rm logs/*",
+        "rm -r ./logs/",
+        "mv logs/risk_state.json /tmp/",
+        "cp /tmp/forged.json logs/risk_state.json",
+        "nice -n 5 cat config/api_keys.json",
+        "env FOO=1 cat .env",
+    ])
+    def test_more_bypasses_blocked(self, cmd):
+        r = run_guard("Bash", command=cmd)
+        assert r.returncode == 2, (cmd, r.stderr)
+
+
+class TestMarksRound5:
+    def test_fresh_buy_never_inherits_a_saved_mark(self, tmp_path):
+        from agent.core.risk_manager import RiskManager
+        path = tmp_path / "s.json"
+        a = RiskManager(state_path=path)
+        a.open_position("XYZ", 50.0, 1.0)
+        a.check_drawdown({"XYZ": 50.0})
+        b = RiskManager(state_path=path)
+        b.prune_marks()                                     # XYZ was not restored from the DB
+        b.open_position("XYZ", 120.0, 10.0)                 # fresh buy
+        assert b.equity({}) == pytest.approx(b.cash + 1200.0)
+        b.positions["XYZ"].entry_time = datetime.now() - timedelta(hours=1)
+        b.open_position("OTHER", 10.0, 1.0)
+        b.positions["OTHER"].entry_time = datetime.now() - timedelta(hours=1)
+        out = b.reconcile_positions([{"symbol": "OTHER", "qty": 1.0}])
+        assert out["dropped"] == ["XYZ"] and b.realized_pnl == pytest.approx(0.0)   # no phantom -700
+
+    def test_fresh_buy_without_prune_still_does_not_inherit(self, tmp_path):
+        from agent.core.risk_manager import RiskManager
+        path = tmp_path / "s.json"
+        a = RiskManager(state_path=path)
+        a.open_position("XYZ", 50.0, 1.0)
+        a.check_drawdown({"XYZ": 50.0})
+        b = RiskManager(state_path=path)
+        b.open_position("XYZ", 120.0, 10.0)                 # restored=False drops the stale mark
+        assert b.equity({}) == pytest.approx(b.cash + 1200.0)
+
+    def test_restored_position_keeps_its_mark(self, tmp_path):
+        from agent.core.risk_manager import RiskManager
+        path = tmp_path / "s.json"
+        a = RiskManager(state_path=path)
+        a.open_position("XYZ", 50.0, 1.0)
+        a.check_drawdown({"XYZ": 40.0})
+        b = RiskManager(state_path=path)
+        b.open_position("XYZ", 50.0, 1.0, restored=True)
+        b.prune_marks()
+        assert b.equity({}) == pytest.approx(b.cash + 40.0)
+
+    def test_no_save_churn_from_orphan_or_mixed_case_marks(self, rm, monkeypatch):
+        saves = []
+        orig = rm._save_state
+        monkeypatch.setattr(rm, "_save_state", lambda *a, **k: saves.append(1) or orig(*a, **k))
+        rm._last_marks["ORPHAN"] = 5.0                      # not a tracked position
+        rm.open_position("aapl", 10.0, 1.0)
+        rm.check_drawdown({"aapl": 10.0})
+        n = len(saves)
+        for _ in range(3):
+            rm.check_drawdown({"aapl": 10.0})
+        assert len(saves) == n                              # idle ticks do not rewrite the file
+
+    def test_failed_save_does_not_mark_marks_as_saved(self, rm, monkeypatch):
+        import os as _os
+        rm.open_position("AAPL", 10.0, 1.0)
+        monkeypatch.setattr(_os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("full")))
+        rm.check_drawdown({"AAPL": 9.0})
+        assert rm.state_save_failed and rm._saved_marks.get("AAPL") is None
+        monkeypatch.undo()
+        rm.check_drawdown({"AAPL": 9.0})                  # retried on the next tick
+        assert not rm.state_save_failed and rm._saved_marks.get("AAPL") == pytest.approx(9.0)
+
+    def test_reset_script_path_preserves_saved_marks(self, tmp_path):
+        from agent.core.risk_manager import RiskManager
+        path = tmp_path / "s.json"
+        a = RiskManager(state_path=path)
+        a.open_position("QQQ", 100.0, 1.0)
+        a.check_drawdown({"QQQ": 90.0})
+        op = RiskManager(state_path=path)                   # standalone operator process
+        op.reset_drawdown_halt(new_peak=95.0)
+        assert json.loads(path.read_text())["marks"]["QQQ"]["px"] == pytest.approx(90.0)
+
+    def test_drop_reports_the_age_of_the_mark_used(self, tmp_path):
+        from agent.core.risk_manager import RiskManager
+        path = tmp_path / "s.json"
+        a = RiskManager(state_path=path)
+        a.open_position("AAPL", 10.0, 5.0)
+        a.open_position("MSFT", 10.0, 1.0)
+        a.check_drawdown({"AAPL": 6.0, "MSFT": 10.0})
+        data = json.loads(path.read_text())
+        data["marks"]["AAPL"]["ts"] -= 7200                 # pretend it is two hours old
+        path.write_text(json.dumps(data))
+        b = RiskManager(state_path=path)
+        b.open_position("AAPL", 10.0, 5.0, restored=True)
+        b.open_position("MSFT", 10.0, 1.0, restored=True)
+        out = b.reconcile_positions([{"symbol": "MSFT", "qty": 1.0}])
+        assert 1.9 < out["booked_at_mark_age_h"]["AAPL"] < 2.1
+
+    @pytest.mark.parametrize("qty", [0, 0.0, -3, None, "x"])
+    def test_zero_negative_or_bad_broker_qty_drops_the_position(self, rm, qty):
+        rm.open_position("AAPL", 10.0, 5.0)
+        out = rm.reconcile_positions([{"symbol": "AAPL", "qty": qty, "current_price": 9.0}])
+        assert "AAPL" not in rm.positions and out["dropped"] == ["AAPL"]
+        if isinstance(qty, (int, float)) and qty < 0:
+            assert out["negative_qty"] == ["AAPL"]
+
+    def test_extra_shares_use_broker_average_and_reset_stops(self, rm):
+        rm.open_position("AAPL", 100.0, 1.0)
+        out = rm.reconcile_positions([{"symbol": "AAPL", "qty": 3.0, "avg_entry": 120.0,
+                                        "current_price": 130.0}])
+        pos = rm.positions["AAPL"]
+        assert out["adopted_excess"] == ["AAPL"] and pos.quantity == 3.0
+        assert pos.entry_price == pytest.approx(120.0)
+        assert pos.stop_loss == pytest.approx(120.0 * (1 - rm.max_trade_loss_pct), rel=1e-4)
+        assert pos.target_price > 120.0 and pos.target_price == pytest.approx(
+            120.0 * (1 + 2 * rm.max_trade_loss_pct), rel=1e-4)
+        assert rm.check_stop_losses({"AAPL": 121.0}) == []      # no instant target/stop exit
+
+    def test_just_closed_symbol_is_not_reported_untracked(self, rm):
+        rm.open_position("AAPL", 10.0, 1.0)
+        rm.close_position("AAPL", 11.0, "AI signal")
+        out = rm.reconcile_positions([{"symbol": "AAPL", "qty": 1.0}], grace_seconds=180)
+        assert out["untracked"] == []
+
+
+class TestRound5Misc:
+    def test_can_buy_is_safe_while_another_thread_mutates_positions(self, rm):
+        errors, stop = [], threading.Event()
+
+        def churn():
+            k = 0
+            while not stop.is_set():
+                rm.open_position(f"S{k % 50}", 1.0, 0.01)
+                rm.close_position(f"S{(k + 25) % 50}", 1.0, "x")
+                k += 1
+
+        t = threading.Thread(target=churn)
+        t.start()
+        try:
+            for _ in range(2000):
+                try:
+                    rm.can_buy("ZZZ", 10.0, 0.99)
+                except RuntimeError as e:          # "dictionary changed size during iteration"
+                    errors.append(e)
+        finally:
+            stop.set()
+            t.join()
+        assert errors == []
+
+    def test_strict_positions_tolerate_missing_price(self):
+        from agent.core.execution_engine import ExecutionEngine
+        eng = ExecutionEngine.__new__(ExecutionEngine)
+        eng._ensure_connected = lambda: None
+        p = MagicMock(symbol="AAPL", qty="2", avg_entry_price="10", current_price=None,
+                      market_value=None, unrealized_pl=None, unrealized_plpc=None)
+        eng._trading_client = MagicMock()
+        eng._trading_client.get_all_positions.return_value = [p]
+        out = eng.get_positions_strict()
+        assert out[0]["qty"] == 2.0 and out[0]["current_price"] is None
+
+    def test_strict_positions_refuse_a_missing_quantity(self):
+        from agent.core.execution_engine import ExecutionEngine
+        eng = ExecutionEngine.__new__(ExecutionEngine)
+        eng._ensure_connected = lambda: None
+        eng._trading_client = MagicMock()
+        eng._trading_client.get_all_positions.return_value = [MagicMock(symbol="AAPL", qty=None)]
+        with pytest.raises(ValueError):
+            eng.get_positions_strict()
+
+    def test_buy_amount_never_exceeds_what_can_buy_approved(self, agent):
+        agent.cfg = {"risk": {"total_fund": 100.0, "max_position_pct": 0.15,
+                              "min_cash_reserve_pct": 0.2}}
+        agent.decision_engine = MagicMock()
+        agent._check_drawdown = MagicMock()
+        agent.risk_manager = MagicMock(drawdown_halted=False, emergency_stop=False, cash=100.0)
+        agent.risk_manager.trading_allowed.return_value = True
+        agent.execution.buy.return_value = MagicMock(status="filled", filled_price=10.0, quantity=0.8)
+        decision = MagicMock(action="BUY", symbol="AAPL", price=10.0, quantity=0.8, confidence=0.9)
+        agent._execute_decision(decision)
+        assert agent.execution.buy.call_args.kwargs["dollar_amount"] == pytest.approx(8.0)
+
+
+class TestHeredocHelpersDirectly:
+    """Unit tests of the two heredoc helpers, so neither can regress behind the other."""
+
+    @staticmethod
+    def guard():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("guard_mod", GUARD)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_quoted_heredoc_with_only_whitespace_before_paren_is_scrubbed(self):
+        g = self.guard()
+        seg = "git commit -m \"$(cat <<'EOF'\nTRADING_MODE=live is human-only\nEOF\n)\""
+        # the original pair of quotes around $(...) plus the empty string that replaced the body
+        assert g.strip_safe_heredocs(seg) == "git commit -m " + '"' + '""' + '"'
+        assert "TRADING_MODE" not in g.strip_safe_heredocs(seg)
+
+    def test_text_after_the_first_delimiter_is_never_scrubbed(self):
+        g = self.guard()
+        seg = "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\nrm logs/risk_state.json\nEOF\n)\""
+        assert "rm logs/risk_state.json" in g.strip_safe_heredocs(seg)
+
+    def test_unquoted_delimiter_is_never_scrubbed(self):
+        g = self.guard()
+        seg = "git commit -m \"$(cat <<EOF\n$(bash -c 'x')\nEOF\n)\""
+        assert g.strip_safe_heredocs(seg) == seg
+
+    def test_command_after_the_closing_paren_is_kept(self):
+        g = self.guard()
+        seg = "echo \"$(cat <<'EOF'\nmsg\nEOF\n) ; rm logs/risk_state.json\""
+        assert "rm logs/risk_state.json" in g.strip_safe_heredocs(seg)
+
+    def test_stdin_heredoc_helper_keeps_everything_after_the_first_delimiter(self):
+        g = self.guard()
+        cmd = "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\nrm logs/risk_state.json\nEOF\n)\""
+        assert "rm logs/risk_state.json" in g.strip_message_stdin_heredocs(cmd)
+
+    def test_stdin_heredoc_helper_only_applies_to_quoted_delimiters(self):
+        g = self.guard()
+        cmd = "git commit -F - <<EOF\n$(cat .env)\nEOF"
+        assert g.strip_message_stdin_heredocs(cmd) == cmd
+
+
+class TestCanBuyLockDeterministic:
+    def test_can_buy_waits_for_the_position_lock(self, rm):
+        done = threading.Event()
+        t = threading.Thread(target=lambda: (rm.can_buy("ZZZ", 10.0, 0.99), done.set()))
+        rm._lock.acquire()                    # the monitor thread is mid-reconcile
+        t.start()
+        assert not done.wait(0.3)             # can_buy must not read positions meanwhile
+        rm._lock.release()
+        assert done.wait(2)
+        t.join()
