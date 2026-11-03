@@ -748,3 +748,130 @@ class TestHookRound3:
         assert ok.returncode == 0, ok.stderr
         blocked = self._launcher({"tool_name": "Bash", "tool_input": {"command": "cat .env"}}, path=path)
         assert blocked.returncode == 2
+
+
+# ═══ review round 4 ═════════════════════════════════════════════════════════
+
+class TestColdStartBooking:
+    def test_loss_while_down_is_booked_from_persisted_marks_after_restart(self, tmp_path):
+        from agent.core.risk_manager import RiskManager
+        path = tmp_path / "s.json"
+        a = RiskManager(state_path=path)
+        a.open_position("AAPL", 10.0, 5.0)
+        a.open_position("MSFT", 10.0, 1.0)
+        a.check_drawdown({"AAPL": 6.0, "MSFT": 10.0})        # marks persisted by the minute check
+        b = RiskManager(state_path=path)                     # agent restarts; AAPL was stopped out
+        b.open_position("AAPL", 10.0, 5.0)                   # DB recovery
+        b.open_position("MSFT", 10.0, 1.0)
+        out = b.reconcile_positions([{"symbol": "MSFT", "qty": 1.0}])   # cold start: no live marks
+        assert out["dropped"] == ["AAPL"] and out["unbooked"] == []
+        assert b.realized_pnl == pytest.approx(-20.0)
+
+    def test_marks_survive_in_the_state_file(self, tmp_path):
+        from agent.core.risk_manager import RiskManager
+        path = tmp_path / "s.json"
+        a = RiskManager(state_path=path)
+        a.open_position("AAPL", 10.0, 5.0)
+        a.check_drawdown({"AAPL": 7.25})
+        assert json.loads(path.read_text())["marks"]["AAPL"] == pytest.approx(7.25)
+
+    def test_junk_marks_in_state_file_are_ignored_not_fatal(self, tmp_path):
+        from agent.core.risk_manager import RiskManager
+        path = tmp_path / "s.json"
+        path.write_text(json.dumps({"peak_equity": 100.0, "drawdown_halted": False,
+                                    "marks": {"A": "x", "B": -1, "C": 5.0}}))
+        a = RiskManager(state_path=path)
+        assert a._last_marks == {"C": 5.0} and not a.drawdown_halted
+
+    def test_marks_are_cleared_when_a_position_closes_and_reopens(self, rm):
+        rm.open_position("AAPL", 10.0, 5.0)
+        rm.equity({"AAPL": 6.0})
+        rm.close_position("AAPL", 6.0, "stop_loss")
+        rm.open_position("AAPL", 20.0, 1.0)
+        assert rm.equity({}) == pytest.approx(rm.cash + 20.0)      # entry price, not the old 6.0 mark
+
+    def test_extra_shares_at_the_broker_weight_the_entry_price(self, rm):
+        rm.open_position("AAPL", 10.0, 2.0)
+        rm.equity({"AAPL": 14.0})
+        rm.reconcile_positions([{"symbol": "AAPL", "qty": 4.0, "current_price": 14.0}])
+        pos = rm.positions["AAPL"]
+        assert pos.quantity == 4.0 and pos.entry_price == pytest.approx((10 * 2 + 14 * 2) / 4)
+
+
+class TestGraceBeforeBlockedEmpty:
+    def test_only_young_positions_and_empty_broker_is_not_a_false_alarm(self, rm):
+        rm.open_position("AAPL", 10.0, 2.0)                       # first buy of the day, not listed yet
+        out = rm.reconcile_positions([], grace_seconds=180)
+        assert out["blocked_empty"] == [] and "AAPL" in out["skipped_new"]
+        assert "AAPL" in rm.positions
+
+    def test_old_position_with_empty_broker_is_still_blocked(self, rm):
+        rm.open_position("AAPL", 10.0, 2.0)
+        rm.positions["AAPL"].entry_time = datetime.now() - timedelta(minutes=30)
+        out = rm.reconcile_positions([], grace_seconds=180)
+        assert out["blocked_empty"] == ["AAPL"] and "AAPL" in rm.positions
+
+
+class TestLockingAroundReconcileAndAlerts:
+    def test_reconcile_waits_for_an_in_flight_sell(self, agent):
+        agent.execution.get_account.return_value = {"equity": 1}
+        agent.execution.get_positions_strict.return_value = [{"symbol": "X", "qty": 1}]
+        agent.risk_manager.reconcile_positions.return_value = {
+            "dropped": [], "resized": [], "untracked": [], "blocked_empty": [],
+            "unbooked": [], "skipped_new": []}
+        agent._exit_lock.acquire()                                # a sell is mid-flight
+        t = threading.Thread(target=agent._reconcile_with_broker)
+        t.start()
+        t.join(0.3)
+        assert t.is_alive() and agent.risk_manager.reconcile_positions.call_count == 0
+        agent._exit_lock.release()
+        t.join(2)
+        assert agent.risk_manager.reconcile_positions.call_count == 1
+
+    def test_notifier_is_called_after_the_lock_is_released(self, agent):
+        seen = []
+        agent.risk_manager.positions = {"AAPL": object()}
+        agent.execution.sell.return_value = MagicMock(status="error", error_msg="timeout")
+        agent.notifier.error.side_effect = lambda *a, **k: seen.append(agent._exit_lock.locked())
+        agent._process_exit("AAPL", 9.0, "stop_loss")
+        agent.risk_manager.close_position.return_value = 0.0
+        agent.execution.sell.return_value = MagicMock(status="filled", filled_price=9.0, error_msg="")
+        agent.notifier.stop_loss.side_effect = lambda *a, **k: seen.append(agent._exit_lock.locked())
+        agent._exit_alerted.clear()
+        agent._process_exit("AAPL", 9.0, "stop_loss")
+        assert seen == [False, False]
+
+
+class TestHookRound4:
+    @pytest.mark.parametrize("tool,args", [
+        ("Bash", {"command": "pytest -k risk_state 2>&1 | tail"}),
+        ("Bash", {"command": "cat logs/risk_state.json 2>/dev/null"}),
+        ("Bash", {"command": "echo hi > /tmp/x; cat tests/test_risk_state.py"}),
+        ("Bash", {"command": "python scripts/run_backtest.py > out.txt; echo risk_state"}),
+        ("Bash", {"command": "cd x && git commit -m \"mention TRADING_MODE=live docs\""}),
+        ("Bash", {"command": "git commit -m \"$(cat <<'EOF'\nfix: tidy reset_drawdown_halt() docs\n\n"
+                             "Mentions TRADING_MODE=live in prose.\nEOF\n)\""}),
+        ("Bash", {"command": "gh pr create --body \"$(cat <<'EOF'\nUses reset_drawdown_halt() safely\nEOF\n)\""}),
+        ("Edit", {"file_path": "/repo/agent/core/risk_state.py", "new_string": "x = 1"}),
+        ("Read", {"file_path": "/repo/data/key_metrics.csv"}),
+        ("Bash", {"command": "cat data/key_levels.json"}),
+    ])
+    def test_allows_normal_work(self, tool, args):
+        r = run_guard(tool, **args)
+        assert r.returncode == 0, (tool, args, r.stderr)
+
+    @pytest.mark.parametrize("tool,args", [
+        ("Bash", {"command": "cat config/api_keys.json"}),
+        ("Bash", {"command": "cat secrets_manager.yaml"}),
+        ("Bash", {"command": "head -5 keys.txt"}),
+        ("Bash", {"command": "python -c \"open('logs/risk_state.json','w').write('{}')\""}),
+        ("Bash", {"command": "python -c \"import json;json.dump({}, open('logs/risk_state.json','w'))\""}),
+        ("Bash", {"command": "bash <<'EOF'\nTRADING_MODE=live python -m agent.main\nEOF"}),
+        ("Bash", {"command": "eval \"$(cat <<'EOF'\nTRADING_MODE=live python x.py\nEOF\n)\""}),
+        ("Bash", {"command": "git commit -m 'x'; TRADING_MODE=live python y.py"}),
+        ("Bash", {"command": "echo ok && cat .env"}),
+        ("Bash", {"command": "git commit -m \"$(cat .env)\""}),
+    ])
+    def test_still_blocks(self, tool, args):
+        r = run_guard(tool, **args)
+        assert r.returncode == 2, (tool, args, r.stdout, r.stderr)

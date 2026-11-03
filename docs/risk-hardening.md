@@ -25,8 +25,11 @@ the last position was never saved).
 
 ## Reconciliation details
 A position the broker no longer holds is dropped and its loss/gain is **booked at the last known mark** (or the
-broker's price), so a stop that fired while the agent was down still counts toward the drawdown; with no mark it is
-booked at cost and listed as `unbooked`. Reconciliation also runs about every 5 minutes while the market is open,
+broker's price), so a stop that fired while the agent was down still counts toward the drawdown. Marks of open
+positions are saved in `logs/risk_state.json` about once a minute, so this also works after a restart (the booked
+price is the last mark before shutdown, which can be stale). With no mark at all it is booked at cost and listed as
+`unbooked`: that loss is NOT recorded, so check the broker. Extra shares at the broker are weight-averaged into the
+entry price. The empty-broker safeguard ignores positions still inside the 3-minute grace window. Reconciliation also runs about every 5 minutes while the market is open,
 skipping positions opened in the last 3 minutes (a just-accepted order may not show at the broker yet). Alerts fire
 only when the findings change.
 
@@ -66,6 +69,12 @@ corrupt or non-finite file halts buys until an operator resets, and is first mov
 log and Telegram alert say so.
 
 ## Limits
+- The reset script cannot detect a running agent; "stop the agent first" is advisory.
+- `execution.sell` runs under the sell lock; make sure the Alpaca client has a request timeout, or a hung call would
+  block the stop-loss monitor.
+- `drawdown_halted` in the state file is read with `bool()`, so any non-empty string (even `"false"`) means halted.
+  That fails safe.
+- The hook launcher is POSIX `sh`; Windows needs a bash-compatible shell (Git Bash) on PATH or the hook blocks.
 A position whose sell fails with "position does not exist" is cleared locally only after a successful positions call confirms the broker no longer holds it. After startup, broker prices seed the equity marks so a feed outage cannot hide a loss behind entry-price marking.
 
 The halt blocks new buys only (no liquidation, stops stay in place). It is evaluated every minute while the market is

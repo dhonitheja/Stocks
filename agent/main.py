@@ -311,8 +311,10 @@ class StockSageAgent:
                 logger.warning("[Reconcile] Broker unreachable; skipping position reconciliation")
                 return
             # Strict call: raises on failure instead of returning [] (which would look like "flat").
-            result = self.risk_manager.reconcile_positions(
-                self.execution.get_positions_strict(), grace_seconds=grace_seconds)
+            broker_positions = self.execution.get_positions_strict()   # network: outside the lock
+            with self._exit_lock:   # so it cannot interleave with a sell that is mid-flight
+                result = self.risk_manager.reconcile_positions(
+                    broker_positions, grace_seconds=grace_seconds)
             sig = (tuple(result["dropped"]), tuple(result["resized"]), tuple(result["untracked"]),
                    tuple(result["blocked_empty"]))
             if any(sig) and sig != self._last_reconcile_sig:   # alert on change, not every cycle
@@ -333,6 +335,10 @@ class StockSageAgent:
 
     def _process_exit(self, symbol: str, price: float, reason: str) -> bool:
         """Sell at the broker, and record the close only if the broker accepted the order."""
+        alerts: list = []          # notifier calls are network I/O: send them after the lock is released
+        done = False
+        booked = price
+        pnl = 0.0
         with self._exit_lock:   # one sell/close at a time across the monitor and the main loop
             if symbol not in self.risk_manager.positions:
                 return False  # already closed by another path (e.g. the AI SELL); nothing to do
@@ -345,21 +351,25 @@ class StockSageAgent:
                     logger.warning(f"{symbol} is not held at the broker; closing local record")
                     self.risk_manager.close_position(symbol, price, "closed_at_broker")
                     self._persist_positions()
-                    self.notifier.error(f"{symbol} was already closed at the broker; local record cleared")
                     self._exit_alerted.discard(symbol)
-                    return True
-                logger.error(f"Exit sell failed for {symbol}: {result.error_msg}")
-                if symbol not in self._exit_alerted:  # alert once per symbol, not every minute
-                    self._exit_alerted.add(symbol)
-                    self.notifier.error(
-                        f"Exit sell FAILED for {symbol}: {result.error_msg} (retrying each cycle)")
-                return False
-            self._exit_alerted.discard(symbol)
-            booked = self._booked_price(result, price)
-            pnl = self.risk_manager.close_position(symbol, booked, reason)
-            self._persist_positions()
-        self.notifier.stop_loss(symbol, booked, pnl)
-        return True
+                    alerts.append(("error", (f"{symbol} was already closed at the broker; local record cleared",)))
+                    done = True
+                else:
+                    logger.error(f"Exit sell failed for {symbol}: {result.error_msg}")
+                    if symbol not in self._exit_alerted:  # alert once per symbol, not every minute
+                        self._exit_alerted.add(symbol)
+                        alerts.append(("error", (
+                            f"Exit sell FAILED for {symbol}: {result.error_msg} (retrying each cycle)",)))
+            else:
+                self._exit_alerted.discard(symbol)
+                booked = self._booked_price(result, price)
+                pnl = self.risk_manager.close_position(symbol, booked, reason)
+                self._persist_positions()
+                alerts.append(("stop_loss", (symbol, booked, pnl)))
+                done = True
+        for name, args in alerts:
+            getattr(self.notifier, name)(*args)
+        return done
 
     def _absent_at_broker(self, symbol: str) -> bool:
         """True only if a successful positions call shows the symbol is not held."""

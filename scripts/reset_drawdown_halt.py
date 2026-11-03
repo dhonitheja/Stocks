@@ -21,7 +21,7 @@ def main() -> int:
                     help="peak equity to restart from (current equity)")
     ap.add_argument("--state-path", type=Path, help=argparse.SUPPRESS)  # tests
     args = ap.parse_args()
-    if args.new_peak is not None and not (args.new_peak == args.new_peak and 0 < args.new_peak < float("inf")):
+    if not (args.new_peak == args.new_peak and 0 < args.new_peak < float("inf")):
         ap.error("--new-peak must be a finite number greater than 0")
     rm = RiskManager(state_path=args.state_path)
     print(f"Halt active:      {rm.drawdown_halted}")

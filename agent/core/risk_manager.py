@@ -114,6 +114,9 @@ class RiskManager:
         self.state_missing = False   # True when no state file existed at startup
         self._state_lock = threading.Lock()
         self._last_marks: Dict[str, float] = {}
+        self._saved_marks: Dict[str, float] = {}
+        self._mark_warned: set = set()
+        self._blocked_logged: tuple = ()
         self._now = lambda: datetime.now(self._tz)   # injectable clock for tests
 
         self.positions: Dict[str, Position] = {}
@@ -252,6 +255,7 @@ class RiskManager:
         )
         with self._lock:
             self.positions[symbol] = pos
+            self._mark_warned.discard(symbol)
             self.cash -= price * quantity
 
         logger.info(
@@ -268,6 +272,7 @@ class RiskManager:
             if symbol not in self.positions:
                 return 0.0
             pos = self.positions.pop(symbol)
+            self._last_marks.pop(symbol, None)
             pnl = pos.current_pnl(price)
             self.realized_pnl += pnl
             self.daily_pnl += pnl
@@ -335,7 +340,10 @@ class RiskManager:
                     self._last_marks[sym] = px
                 else:
                     px = self._last_marks.get(sym) or p.entry_price
-                    logger.warning(f"[Equity] No live price for {sym}; marking at ${px:.2f}")
+                    if sym not in self._mark_warned:     # once per symbol, not every minute
+                        self._mark_warned.add(sym)
+                        logger.error(f"[Equity] No live price for {sym}; marking at ${px:.2f}. "
+                                     "Losses on it are invisible until prices return.")
                 total += p.quantity * px
             return total
 
@@ -360,7 +368,12 @@ class RiskManager:
                     f"🔴 MAX DRAWDOWN HALT | equity ${eq:,.2f} is {drawdown:.1%} below peak "
                     f"${self.peak_equity:,.2f} (limit {self.max_drawdown_pct:.0%}). New buys blocked."
                 )
-        if changed:
+        with self._lock:
+            marks_moved = any(
+                abs(self._last_marks.get(k, 0) - self._saved_marks.get(k, 0)) >= 0.01
+                for k in self._last_marks
+            ) or set(self._saved_marks) - set(self._last_marks) != set()
+        if changed or marks_moved:
             self._save_state()
         return self.drawdown_halted
 
@@ -382,7 +395,11 @@ class RiskManager:
                     "peak_equity": self.peak_equity,
                     "drawdown_halted": self.drawdown_halted,
                     "realized_pnl": self.realized_pnl,
+                    # marks of open positions only, so a cold start can book down-time losses and
+                    # a re-bought symbol never inherits an old trade's mark
+                    "marks": {k: v for k, v in self._last_marks.items() if k in self.positions},
                 }
+                self._saved_marks = dict(snapshot["marks"])
             try:
                 self._state_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self._state_path.with_suffix(".tmp")
@@ -415,6 +432,13 @@ class RiskManager:
             if not (math.isfinite(peak) and peak > 0 and math.isfinite(realized)):
                 raise ValueError("non-finite or non-positive value")
             self.peak_equity, self.realized_pnl, self.drawdown_halted = peak, realized, halted
+            marks = data.get("marks", {})
+            if isinstance(marks, dict):
+                self._last_marks = {
+                    str(k): float(v) for k, v in marks.items()
+                    if isinstance(v, (int, float)) and math.isfinite(v) and v > 0
+                }
+                self._saved_marks = dict(self._last_marks)
             if halted:
                 logger.critical("🔴 Max drawdown halt restored from previous session")
         except Exception as exc:  # any unreadable state fails safe: halt rather than trade unguarded
@@ -451,21 +475,27 @@ class RiskManager:
         dropped, resized, unbooked, young = [], [], [], []
         now = datetime.now()
         with self._lock:
-            if not held and self.positions:
-                # An empty broker list while we track positions is far more likely a failed or
-                # partial call than a real flat book. Never wipe tracking on that evidence.
-                blocked = sorted(self.positions)
-                logger.critical(
-                    f"[Reconcile] Broker reports NO positions but {blocked} are tracked; "
-                    "refusing to drop them automatically. Verify at the broker."
-                )
-                return {"dropped": [], "resized": [], "untracked": [], "blocked_empty": blocked,
-                        "unbooked": [], "skipped_new": []}
             tracked = {k.upper().strip(): k for k in self.positions}
+            def is_young(pos):
+                return bool(grace_seconds) and (now - pos.entry_time).total_seconds() < grace_seconds
+            young = [k for k in self.positions if is_young(self.positions[k])]
+            old_keys = [k for k in self.positions if k not in young]
+            if not held and old_keys:
+                # An empty broker list while we track (non-new) positions is far more likely a failed
+                # or partial call than a real flat book. Never wipe tracking on that evidence.
+                blocked = sorted(old_keys)
+                if tuple(blocked) != self._blocked_logged:        # log on change, not every cycle
+                    self._blocked_logged = tuple(blocked)
+                    logger.critical(
+                        f"[Reconcile] Broker reports NO positions but {blocked} are tracked; "
+                        "refusing to drop them automatically. Verify at the broker."
+                    )
+                return {"dropped": [], "resized": [], "untracked": [], "blocked_empty": blocked,
+                        "unbooked": [], "skipped_new": sorted(young)}
+            self._blocked_logged = ()
             for norm, key in list(tracked.items()):
                 pos = self.positions[key]
-                if grace_seconds and (now - pos.entry_time).total_seconds() < grace_seconds:
-                    young.append(key)
+                if key in young:
                     continue
                 mark = self._last_marks.get(norm) or self._last_marks.get(key)
                 bp = held.get(norm, {}).get("current_price")
@@ -478,17 +508,21 @@ class RiskManager:
                     self.daily_pnl += pnl
                     self.cash += price * pos.quantity
                     del self.positions[key]
+                    self._last_marks.pop(key, None)
+                    self._last_marks.pop(norm, None)
                     dropped.append(key)
                     if not mark:
                         unbooked.append(key)
                     continue
                 broker_qty = float(held[norm]["qty"])
                 if abs(broker_qty - pos.quantity) > 1e-6:
-                    delta = pos.quantity - broker_qty        # > 0 means shares left without us
-                    if delta > 0:
+                    delta = pos.quantity - broker_qty
+                    if delta > 0:                 # shares left without us: book at the mark
                         pnl = (price - pos.entry_price) * delta
                         self.realized_pnl += pnl
                         self.daily_pnl += pnl
+                    elif broker_qty > 0:          # extra shares: weighted-average the entry price
+                        pos.entry_price = (pos.entry_price * pos.quantity + price * -delta) / broker_qty
                     self.cash += delta * price
                     pos.quantity = broker_qty
                     resized.append(key)
@@ -510,7 +544,7 @@ class RiskManager:
         if dropped or resized:
             self._save_state()
         return {"dropped": dropped, "resized": resized, "untracked": untracked,
-                "blocked_empty": [], "unbooked": unbooked, "skipped_new": young}
+                "blocked_empty": [], "unbooked": unbooked, "skipped_new": sorted(young)}
 
     def trading_allowed(self) -> bool:
         """True when no halt is active. Re-check immediately before placing an order."""
