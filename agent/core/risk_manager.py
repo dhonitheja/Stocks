@@ -8,6 +8,7 @@ import json
 import math
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from pathlib import Path
@@ -418,22 +419,37 @@ class RiskManager:
                 logger.critical("🔴 Max drawdown halt restored from previous session")
         except Exception as exc:  # any unreadable state fails safe: halt rather than trade unguarded
             self.drawdown_halted = True
-            logger.critical(f"Risk state unreadable ({exc}); halting new buys until an operator resets")
+            aside = self._state_path.with_name(f"{self._state_path.name}.corrupt-{int(time.time())}")
+            try:  # keep the evidence (peak, realized P&L) instead of overwriting it on the next save
+                self._state_path.rename(aside)
+                kept = f"original kept as {aside.name}"
+            except OSError:
+                kept = "could not move the original aside"
+            logger.critical(
+                f"Risk state unreadable ({exc}); {kept}. Halting new buys until an operator runs "
+                "scripts/reset_drawdown_halt.py --new-peak <current equity>. Realized P&L restarts at 0; "
+                "recover it from the preserved file if needed."
+            )
+            self._save_state()   # persist the halt now, or a restart would see "no file" and un-halt
 
     # ─── Broker reconciliation ────────────────────────────────
 
-    def reconcile_positions(self, broker_positions: List[dict]) -> dict:
+    def reconcile_positions(self, broker_positions: List[dict], grace_seconds: float = 0.0) -> dict:
         """
         Make tracked positions match the broker, which is the source of truth.
 
-        - tracked but not at the broker -> dropped (cash restored at cost)
-        - quantity differs              -> broker quantity wins
+        - tracked but not at the broker -> dropped; the loss/gain is booked at the last known mark
+          (cost basis, i.e. zero P&L, only when no mark exists -> listed under `unbooked`)
+        - quantity differs              -> broker quantity wins (the difference is booked likewise)
         - at the broker but untracked   -> NOT adopted (may not belong to this agent); reported
+        - positions opened less than `grace_seconds` ago are left alone (a just-accepted order may
+          not show at the broker yet); use ~180 for periodic runs, 0 at startup.
         Callers must pass a list from a call that verifiably succeeded (not one that swallowed an
         error). An empty list while positions are tracked is refused and reported as `blocked_empty`.
         """
         held = {str(p["symbol"]).upper().strip(): p for p in broker_positions}
-        dropped, resized = [], []
+        dropped, resized, unbooked, young = [], [], [], []
+        now = datetime.now()
         with self._lock:
             if not held and self.positions:
                 # An empty broker list while we track positions is far more likely a failed or
@@ -443,31 +459,58 @@ class RiskManager:
                     f"[Reconcile] Broker reports NO positions but {blocked} are tracked; "
                     "refusing to drop them automatically. Verify at the broker."
                 )
-                return {"dropped": [], "resized": [], "untracked": [], "blocked_empty": blocked}
-            for sym in list(self.positions):
-                pos = self.positions[sym]
-                if sym not in held:
-                    self.cash += pos.cost_basis
-                    del self.positions[sym]
-                    dropped.append(sym)
+                return {"dropped": [], "resized": [], "untracked": [], "blocked_empty": blocked,
+                        "unbooked": [], "skipped_new": []}
+            tracked = {k.upper().strip(): k for k in self.positions}
+            for norm, key in list(tracked.items()):
+                pos = self.positions[key]
+                if grace_seconds and (now - pos.entry_time).total_seconds() < grace_seconds:
+                    young.append(key)
                     continue
-                broker_qty = float(held[sym]["qty"])
+                mark = self._last_marks.get(norm) or self._last_marks.get(key)
+                bp = held.get(norm, {}).get("current_price")
+                if isinstance(bp, (int, float)) and bp > 0:
+                    mark = float(bp)
+                price = mark if mark else pos.entry_price
+                if norm not in held:
+                    pnl = (price - pos.entry_price) * pos.quantity
+                    self.realized_pnl += pnl
+                    self.daily_pnl += pnl
+                    self.cash += price * pos.quantity
+                    del self.positions[key]
+                    dropped.append(key)
+                    if not mark:
+                        unbooked.append(key)
+                    continue
+                broker_qty = float(held[norm]["qty"])
                 if abs(broker_qty - pos.quantity) > 1e-6:
-                    self.cash += (pos.quantity - broker_qty) * pos.entry_price
+                    delta = pos.quantity - broker_qty        # > 0 means shares left without us
+                    if delta > 0:
+                        pnl = (price - pos.entry_price) * delta
+                        self.realized_pnl += pnl
+                        self.daily_pnl += pnl
+                    self.cash += delta * price
                     pos.quantity = broker_qty
-                    resized.append(sym)
-            for sym, bp in held.items():  # broker marks, so a feed outage right after startup
+                    resized.append(key)
+                    if not mark:
+                        unbooked.append(key)
+            for norm, bp in held.items():  # broker marks, so a feed outage right after startup
                 px = bp.get("current_price")  # cannot hide a loss behind entry-price marking
-                if sym in self.positions and isinstance(px, (int, float)) and px > 0:
-                    self._last_marks[sym] = float(px)
-            untracked = sorted(s for s in held if s not in self.positions)
+                if norm in tracked and isinstance(px, (int, float)) and px > 0:
+                    self._last_marks[norm] = float(px)
+            untracked = sorted(s for s in held if s not in tracked)
         for sym in dropped:
-            logger.warning(f"[Reconcile] {sym} tracked locally but not held at broker; dropped")
+            logger.warning(f"[Reconcile] {sym} tracked locally but not held at broker; dropped and booked")
         for sym in resized:
             logger.warning(f"[Reconcile] {sym} quantity adjusted to broker value")
+        if unbooked:
+            logger.warning(f"[Reconcile] No mark for {unbooked}; booked at cost (P&L unknown, check broker)")
         if untracked:
             logger.warning(f"[Reconcile] Broker holds untracked positions (not adopted): {untracked}")
-        return {"dropped": dropped, "resized": resized, "untracked": untracked, "blocked_empty": []}
+        if dropped or resized:
+            self._save_state()
+        return {"dropped": dropped, "resized": resized, "untracked": untracked,
+                "blocked_empty": [], "unbooked": unbooked, "skipped_new": young}
 
     def trading_allowed(self) -> bool:
         """True when no halt is active. Re-check immediately before placing an order."""

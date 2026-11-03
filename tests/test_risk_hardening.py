@@ -2,6 +2,7 @@
 Eastern-time reset, exit processing, and the PreToolUse guard hook. No network."""
 import json
 import subprocess
+import threading
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -114,7 +115,8 @@ class TestReconcile:
     def test_symbols_are_normalized(self, rm):
         rm.open_position("AAPL", 10.0, 2.0)
         out = rm.reconcile_positions([{"symbol": " aapl ", "qty": 2.0}])
-        assert out == {"dropped": [], "resized": [], "untracked": [], "blocked_empty": []}
+        assert out["dropped"] == [] and out["resized"] == [] and out["untracked"] == [] \
+            and out["blocked_empty"] == []
 
     def test_broker_quantity_wins(self, rm):
         rm.open_position("AAPL", 10.0, 2.0)
@@ -128,7 +130,8 @@ class TestReconcile:
     def test_matching_positions_untouched(self, rm):
         rm.open_position("AAPL", 10.0, 2.0)
         out = rm.reconcile_positions([{"symbol": "AAPL", "qty": 2.0}])
-        assert out == {"dropped": [], "resized": [], "untracked": [], "blocked_empty": []}
+        assert out["dropped"] == [] and out["resized"] == [] and out["untracked"] == [] \
+            and out["blocked_empty"] == []
 
 
 # ── restart / state robustness ──────────────────────────────────
@@ -250,6 +253,9 @@ def agent(monkeypatch):
     a.notifier = MagicMock()
     a._persist_positions = MagicMock()
     a._exit_alerted = set()
+    a._exit_lock = threading.Lock()
+    a._last_reconcile_sig = None
+    a._monitor_tick = 0
     return a
 
 
@@ -331,7 +337,8 @@ class TestReconcileWithBroker:
         agent.execution.get_account.return_value = {"equity": 1}
         agent.execution.get_positions_strict.return_value = []
         agent.risk_manager.reconcile_positions.return_value = {
-            "dropped": [], "resized": [], "untracked": [], "blocked_empty": ["AAPL"]}
+            "dropped": [], "resized": [], "untracked": [], "blocked_empty": ["AAPL"],
+            "unbooked": [], "skipped_new": []}
         agent._reconcile_with_broker()
         agent.notifier.error.assert_called_once()
         assert "verify manually" in agent.notifier.error.call_args[0][0]
@@ -362,6 +369,7 @@ class TestBuyRecheck:
         agent.cfg = {"risk": {"total_fund": 100.0, "max_position_pct": 0.15,
                               "min_cash_reserve_pct": 0.2}}
         agent.decision_engine = MagicMock()
+        agent._check_drawdown = MagicMock()
         rm_ = MagicMock(drawdown_halted=False, emergency_stop=False, cash=100.0)
         rm_.trading_allowed.return_value = False   # halt tripped while "sleeping"
         agent.risk_manager = rm_
@@ -474,3 +482,269 @@ class TestGuardHook:
         assert any("guard.py" in c and "CLAUDE_PROJECT_DIR" in c for c in cmds)
         for t in ("Bash", "Edit", "Write", "Read", "Grep"):
             assert t in matchers
+
+
+# ═══ review round 3 ═════════════════════════════════════════════════════════
+
+class TestDropBookingAndGrace:
+    def test_dropped_position_books_loss_at_last_mark(self, rm):
+        rm.open_position("AAPL", 10.0, 5.0)
+        rm.open_position("MSFT", 10.0, 1.0)
+        rm.equity({"AAPL": 6.0, "MSFT": 10.0})           # marks: AAPL 6.0
+        out = rm.reconcile_positions([{"symbol": "MSFT", "qty": 1.0}])
+        assert out["dropped"] == ["AAPL"] and out["unbooked"] == []
+        assert rm.realized_pnl == pytest.approx(-20.0)    # (6-10)*5 booked, not hidden
+        assert rm.daily_pnl == pytest.approx(-20.0)
+
+    def test_drop_without_a_mark_is_booked_at_cost_and_flagged(self, rm):
+        rm.open_position("AAPL", 10.0, 5.0)
+        rm.open_position("MSFT", 10.0, 1.0)
+        out = rm.reconcile_positions([{"symbol": "MSFT", "qty": 1.0}])
+        assert out["unbooked"] == ["AAPL"] and rm.realized_pnl == 0.0
+
+    def test_booked_loss_counts_toward_the_halt_after_restart(self, tmp_path):
+        from agent.core.risk_manager import RiskManager
+        path = tmp_path / "s.json"
+        a = RiskManager(state_path=path)
+        a.open_position("AAPL", 10.0, 5.0)
+        a.open_position("MSFT", 10.0, 1.0)
+        a.equity({"AAPL": 6.0, "MSFT": 10.0})
+        a.reconcile_positions([{"symbol": "MSFT", "qty": 1.0}])
+        b = RiskManager(state_path=path)
+        assert b.realized_pnl == pytest.approx(-20.0)
+        assert b.check_drawdown({}) is True               # 20% below the $100 peak
+
+    def test_just_opened_positions_get_a_grace_period(self, rm):
+        rm.open_position("AAPL", 10.0, 5.0)
+        rm.open_position("MSFT", 10.0, 1.0)
+        out = rm.reconcile_positions([{"symbol": "MSFT", "qty": 1.0}], grace_seconds=180)
+        assert out["dropped"] == [] and "AAPL" in out["skipped_new"]
+        assert "AAPL" in rm.positions
+
+    def test_old_positions_are_not_protected_by_grace(self, rm):
+        rm.open_position("AAPL", 10.0, 5.0)
+        rm.open_position("MSFT", 10.0, 1.0)
+        rm.positions["AAPL"].entry_time = datetime.now() - timedelta(minutes=10)
+        out = rm.reconcile_positions([{"symbol": "MSFT", "qty": 1.0}], grace_seconds=180)
+        assert out["dropped"] == ["AAPL"]
+
+    def test_lowercase_tracked_keys_are_not_wrongly_dropped(self, rm):
+        rm.open_position("aapl", 10.0, 2.0)
+        out = rm.reconcile_positions([{"symbol": "AAPL", "qty": 2.0}])
+        assert out["dropped"] == [] and out["untracked"] == []
+
+
+class TestCorruptStateIsPreserved:
+    def test_corrupt_file_is_moved_aside_and_halt_persists(self, tmp_path):
+        from agent.core.risk_manager import RiskManager
+        path = tmp_path / "state.json"
+        path.write_text('{"peak_equity": 150, "realized_pnl": -30, BROKEN', encoding="utf-8")
+        a = RiskManager(state_path=path)
+        assert a.drawdown_halted
+        kept = list(tmp_path.glob("state.json.corrupt-*"))
+        assert len(kept) == 1 and "BROKEN" in kept[0].read_text(encoding="utf-8")
+        assert RiskManager(state_path=path).drawdown_halted     # restart still halted
+
+
+class TestResetScript:
+    SCRIPT = str(ROOT / "scripts" / "reset_drawdown_halt.py")
+
+    def _halted_state(self, tmp_path):
+        p = tmp_path / "s.json"
+        p.write_text(json.dumps({"peak_equity": 100.0, "drawdown_halted": True, "realized_pnl": -20.0}))
+        return p
+
+    def _run(self, *args):
+        return subprocess.run([sys.executable, self.SCRIPT, *args], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, cwd=ROOT,
+                              env={**__import__("os").environ, "PYTHONPATH": str(ROOT)})
+
+    def test_requires_new_peak(self, tmp_path):
+        r = self._run("--state-path", str(self._halted_state(tmp_path)))
+        assert r.returncode != 0 and "new-peak" in r.stderr
+
+    def test_refuses_non_interactive_and_leaves_halt_in_place(self, tmp_path):
+        p = self._halted_state(tmp_path)
+        r = self._run("--new-peak", "80", "--state-path", str(p))
+        assert r.returncode == 2 and "non-interactively" in r.stderr
+        assert json.loads(p.read_text())["drawdown_halted"] is True
+
+    @pytest.mark.parametrize("bad", ["nan", "inf", "0", "-5"])
+    def test_rejects_bad_peak(self, tmp_path, bad):
+        r = self._run("--new-peak", bad, "--state-path", str(self._halted_state(tmp_path)))
+        assert r.returncode != 0
+
+
+class TestExitConcurrencyAndBooking:
+    def _agent_with_real_rm(self, agent, tmp_path):
+        from agent.core.risk_manager import RiskManager
+        agent.risk_manager = RiskManager(state_path=tmp_path / "s.json")
+        agent.risk_manager.open_position("AAPL", 10.0, 5.0)
+        return agent
+
+    def test_two_threads_selling_the_same_symbol_sell_once(self, agent, tmp_path):
+        agent = self._agent_with_real_rm(agent, tmp_path)
+        calls = []
+
+        def slow_sell(symbol, reason=""):
+            calls.append(symbol)
+            import time as _t
+            _t.sleep(0.05)
+            return MagicMock(status="filled", filled_price=9.0, error_msg="")
+
+        agent.execution.sell.side_effect = slow_sell
+        results = []
+        ts = [threading.Thread(target=lambda: results.append(agent._process_exit("AAPL", 9.5, "stop_loss")))
+              for _ in range(4)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        assert calls == ["AAPL"] and results.count(True) == 1
+        assert "AAPL" not in agent.risk_manager.positions
+
+    def test_exit_is_booked_at_the_broker_fill_price(self, agent, tmp_path):
+        agent = self._agent_with_real_rm(agent, tmp_path)
+        agent.execution.sell.return_value = MagicMock(status="filled", filled_price=8.0, error_msg="")
+        agent._process_exit("AAPL", 9.5, "stop_loss")          # trigger 9.5, actually filled 8.0
+        assert agent.risk_manager.realized_pnl == pytest.approx((8.0 - 10.0) * 5.0)
+
+    def test_falls_back_to_trigger_price_when_no_fill_reported(self, agent, tmp_path):
+        agent = self._agent_with_real_rm(agent, tmp_path)
+        agent.execution.sell.return_value = MagicMock(status="pending", filled_price=0, error_msg="")
+        agent._process_exit("AAPL", 9.5, "stop_loss")
+        assert agent.risk_manager.realized_pnl == pytest.approx((9.5 - 10.0) * 5.0)
+
+    def test_ai_sell_after_monitor_already_closed_does_not_sell_again(self, agent, tmp_path):
+        agent = self._agent_with_real_rm(agent, tmp_path)
+        agent.decision_engine = MagicMock()
+        agent.risk_manager.positions["AAPL"].entry_time = datetime.now() - timedelta(hours=1)
+        agent.execution.sell.return_value = MagicMock(status="filled", filled_price=9.0, error_msg="")
+
+        def monitor_wins_during_delay():
+            agent._process_exit("AAPL", 9.0, "stop_loss")
+
+        agent.decision_engine.apply_human_delay.side_effect = monitor_wins_during_delay
+        agent._execute_decision(MagicMock(action="SELL", symbol="AAPL", price=9.2, confidence=0.9))
+        assert agent.execution.sell.call_count == 1
+        agent.notifier.sell.assert_not_called()                 # no phantom "SOLD +0.00"
+
+
+class TestRealRiskManagerIntegration:
+    def test_open_loss_restart_reconcile_equity_stays_consistent(self, agent, tmp_path):
+        from agent.core.risk_manager import RiskManager
+        path = tmp_path / "s.json"
+        agent.risk_manager = RiskManager(state_path=path)
+        agent.risk_manager.open_position("AAPL", 10.0, 5.0)
+        agent.execution.sell.return_value = MagicMock(status="filled", filled_price=8.0, error_msg="")
+        agent._process_exit("AAPL", 9.0, "stop_loss")           # realized -10
+        fresh = RiskManager(state_path=path)                    # restart
+        assert fresh.cash == pytest.approx(90.0) and fresh.equity() == pytest.approx(90.0)
+        fresh.open_position("MSFT", 20.0, 1.0)                  # recovered from DB with no marks
+        fresh.reconcile_positions([{"symbol": "MSFT", "qty": 1.0, "current_price": 18.0}])
+        assert fresh.equity({}) == pytest.approx(90.0 - 20.0 + 18.0)
+
+    def test_halted_state_with_empty_positions_still_blocks_buys(self, tmp_path):
+        from agent.core.risk_manager import RiskManager
+        path = tmp_path / "s.json"
+        path.write_text(json.dumps({"peak_equity": 100.0, "drawdown_halted": True, "realized_pnl": 0.0}))
+        rm_ = RiskManager(state_path=path)
+        assert rm_.positions == {} and rm_.can_buy("MSFT", 10.0, 0.99)[0] is False
+
+    def test_state_realized_pnl_and_recovered_positions_combine(self, tmp_path):
+        from agent.core.risk_manager import RiskManager
+        path = tmp_path / "s.json"
+        path.write_text(json.dumps({"peak_equity": 100.0, "drawdown_halted": False, "realized_pnl": -12.0}))
+        rm_ = RiskManager(state_path=path)
+        rm_.open_position("AAPL", 10.0, 2.0)                    # DB-recovered position
+        assert rm_.cash == pytest.approx(100.0 - 12.0 - 20.0)
+        assert rm_.equity({"AAPL": 10.0}) == pytest.approx(88.0)
+
+
+class TestFirstDrawdownCheckAndPeriodicReconcile:
+    def test_buy_path_evaluates_drawdown_before_anything_else(self, agent):
+        order = []
+        agent._check_drawdown = MagicMock(side_effect=lambda: order.append("check"))
+        rm_ = MagicMock(drawdown_halted=True, emergency_stop=False)
+        agent.risk_manager = rm_
+        agent._execute_decision(MagicMock(action="BUY", symbol="AAPL", price=10.0, confidence=0.9))
+        assert order == ["check"] and agent.execution.buy.call_count == 0
+
+    def test_periodic_reconcile_uses_a_grace_period(self, agent):
+        agent.execution.get_account.return_value = {"equity": 1}
+        agent.execution.get_positions_strict.return_value = [{"symbol": "X", "qty": 1}]
+        agent.risk_manager.reconcile_positions.return_value = {
+            "dropped": [], "resized": [], "untracked": [], "blocked_empty": [],
+            "unbooked": [], "skipped_new": []}
+        agent._reconcile_with_broker(grace_seconds=180)
+        assert agent.risk_manager.reconcile_positions.call_args.kwargs["grace_seconds"] == 180
+
+    def test_repeated_identical_findings_alert_once(self, agent):
+        agent.execution.get_account.return_value = {"equity": 1}
+        agent.execution.get_positions_strict.return_value = [{"symbol": "TSLA", "qty": 1}]
+        agent.risk_manager.reconcile_positions.return_value = {
+            "dropped": [], "resized": [], "untracked": ["TSLA"], "blocked_empty": [],
+            "unbooked": [], "skipped_new": []}
+        for _ in range(3):
+            agent._reconcile_with_broker(grace_seconds=180)
+        assert agent.notifier.error.call_count == 1
+
+
+class TestHookRound3:
+    @pytest.mark.parametrize("tool,args", [
+        ("Bash", {"command": 'git commit -m "$(cat .env)"'}),
+        ("Bash", {"command": 'echo "$(cat .env)"'}),
+        ("Bash", {"command": 'echo "`cat .env`"'}),
+        ("Bash", {"command": "rm logs/risk_state.json"}),
+        ("Bash", {"command": "echo '{}' > logs/risk_state.json"}),
+        ("Bash", {"command": "mv logs/risk_state.json /tmp/x"}),
+        ("Bash", {"command": 'python -c "from agent.core.risk_manager import RiskManager; '
+                             'RiskManager().reset_drawdown_halt()"'}),
+        ("Edit", {"file_path": "/repo/logs/risk_state.json", "new_string": "{}"}),
+        ("Write", {"file_path": "/repo/logs/risk_state.json", "content": "{}"}),
+        ("Read", {"file_path": "/repo/config/api_keys.json"}),
+        ("Read", {"file_path": "/repo/keys.txt"}),
+    ])
+    def test_blocks(self, tool, args):
+        r = run_guard(tool, **args)
+        assert r.returncode == 2, (tool, args, r.stderr)
+
+    @pytest.mark.parametrize("tool,args", [
+        ("Bash", {"command": 'git commit -m "fix: tidy reset_drawdown_halt docs"'}),
+        ("Bash", {"command": "cat logs/risk_state.json"}),
+        ("Bash", {"command": "python scripts/reset_drawdown_halt.py --new-peak 90"}),
+        ("Read", {"file_path": "/repo/logs/risk_state.json"}),
+        ("Read", {"file_path": "/repo/agent/keyboard_helper.py"}),
+        ("Read", {"file_path": "/repo/docs/api_keys.md"}),
+    ])
+    def test_allows(self, tool, args):
+        r = run_guard(tool, **args)
+        assert r.returncode == 0, (tool, args, r.stderr)
+
+    def _launcher(self, payload, project_dir=None, path=None):
+        import os
+        cfg = json.loads((ROOT / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        cmd = next(h["command"] for g in cfg["hooks"]["PreToolUse"] for h in g["hooks"]
+                   if "guard.py" in h["command"])
+        env = {"CLAUDE_PROJECT_DIR": str(project_dir or ROOT), "PATH": path or os.environ["PATH"]}
+        return subprocess.run(["/bin/sh", "-c", cmd], input=json.dumps(payload), capture_output=True,
+                              text=True, env=env)
+
+    def test_launcher_blocks_when_the_guard_script_crashes(self, tmp_path):
+        hooks = tmp_path / ".claude" / "hooks"
+        hooks.mkdir(parents=True)
+        (hooks / "guard.py").write_text("raise SystemExit(1)\n")        # exit 1 = non-blocking in Claude Code
+        r = self._launcher({"tool_name": "Bash", "tool_input": {"command": "ls"}}, project_dir=tmp_path)
+        assert r.returncode == 2 and "failing closed" in r.stderr
+
+    def test_launcher_falls_back_when_python3_is_a_broken_stub(self, tmp_path):
+        import os
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        stub = bindir / "python3"
+        stub.write_text("#!/bin/sh\nexit 9\n")
+        stub.chmod(0o755)
+        (bindir / "python").symlink_to(sys.executable)
+        path = f"{bindir}:{os.environ['PATH']}"
+        ok = self._launcher({"tool_name": "Bash", "tool_input": {"command": "ls"}}, path=path)
+        assert ok.returncode == 0, ok.stderr
+        blocked = self._launcher({"tool_name": "Bash", "tool_input": {"command": "cat .env"}}, path=path)
+        assert blocked.returncode == 2

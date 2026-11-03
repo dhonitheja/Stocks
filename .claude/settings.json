@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if command -v python3 >/dev/null 2>&1; then python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\"; elif command -v python >/dev/null 2>&1; then python \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\"; else echo \"guard.py: no python interpreter found; blocking\" >&2; exit 2; fi"
+            "command": "PY=python3; python3 -c \"\" >/dev/null 2>&1 || PY=python; $PY -c \"\" >/dev/null 2>&1 || { echo \"guard.py: no working python interpreter; blocking\" >&2; exit 2; }; $PY \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\"; rc=$?; [ \"$rc\" -eq 0 ] || { [ \"$rc\" -eq 2 ] || echo \"guard.py crashed (exit $rc); failing closed\" >&2; exit 2; }"
           }
         ]
       },

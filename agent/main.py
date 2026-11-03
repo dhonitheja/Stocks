@@ -84,6 +84,9 @@ class StockSageAgent:
         # Track today's decisions
         self._decisions: Dict[str, TradeDecision] = {}
         self._exit_alerted: set = set()
+        self._exit_lock = threading.Lock()      # serializes every sell + close (monitor vs main loop)
+        self._last_reconcile_sig = None
+        self._monitor_tick = 0
         self._cycle_count = 0
 
     # ─── Startup ──────────────────────────────────────────────
@@ -101,6 +104,7 @@ class StockSageAgent:
         # Restore open positions from last session
         self._recover_positions()
         self._reconcile_with_broker()
+        self._check_drawdown()   # evaluate before any trading, not after the first monitor tick
         if self.risk_manager.state_missing:
             self.notifier.error(
                 "No risk state file found at startup (fresh peak, no drawdown halt, realized P&L "
@@ -186,8 +190,10 @@ class StockSageAgent:
         """Execute a BUY or SELL decision through the broker."""
 
         if decision.action == "BUY":
-            # Belt and braces: the risk layer already vetoed in can_buy, but a halt can trip
+            # Evaluate drawdown now (not only on the monitor's 60s tick, which may not have run yet
+            # after a restart), then belt and braces: can_buy vetoed earlier, but a halt can trip
             # between decision and execution.
+            self._check_drawdown()
             if self.risk_manager.drawdown_halted or self.risk_manager.emergency_stop:
                 logger.warning(f"BUY {decision.symbol} skipped: trading halted by risk layer")
                 return
@@ -243,27 +249,35 @@ class StockSageAgent:
             if not allowed:
                 return
 
-            self.decision_engine.apply_human_delay()
-            result = self.execution.sell(
-                symbol=decision.symbol,
-                reason="AI signal — sell",
-            )
-
-            if result.status not in ("error", "rejected"):
-                pnl = self.risk_manager.close_position(
-                    decision.symbol,
-                    decision.price,
-                    "AI signal",
+            self.decision_engine.apply_human_delay()   # outside the lock: it can last seconds
+            with self._exit_lock:
+                # The stop-loss monitor may have closed it during the delay.
+                if decision.symbol not in self.risk_manager.positions:
+                    return
+                result = self.execution.sell(
+                    symbol=decision.symbol,
+                    reason="AI signal — sell",
                 )
+                if result.status in ("error", "rejected"):
+                    logger.error(f"AI SELL failed for {decision.symbol}: {result.error_msg}")
+                    return
+                sell_price = self._booked_price(result, decision.price)
+                pnl = self.risk_manager.close_position(decision.symbol, sell_price, "AI signal")
                 self._persist_positions()
-                emoji = "🟢" if pnl >= 0 else "🔴"
-                console.print(
-                    f"[bold red]{emoji} SOLD[/bold red] "
-                    f"[cyan]{decision.symbol}[/cyan] "
-                    f"@ ${decision.price:.2f} | P&L: ${pnl:+.2f}"
-                )
-                self.notifier.sell(decision.symbol, decision.price, pnl)
-                record_trade("SELL", decision.symbol)
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            console.print(
+                f"[bold red]{emoji} SOLD[/bold red] "
+                f"[cyan]{decision.symbol}[/cyan] "
+                f"@ ${sell_price:.2f} | P&L: ${pnl:+.2f}"
+            )
+            self.notifier.sell(decision.symbol, sell_price, pnl)
+            record_trade("SELL", decision.symbol)
+
+    @staticmethod
+    def _booked_price(result, fallback: float) -> float:
+        """Use the broker's fill price when it reported one; else the trigger/signal price."""
+        fp = getattr(result, "filled_price", 0) or 0
+        return float(fp) if isinstance(fp, (int, float)) and fp > 0 else fallback
 
     # ─── Position Recovery ───────────────────────────────────────
 
@@ -288,8 +302,8 @@ class StockSageAgent:
         except Exception as exc:
             logger.warning(f"[Recovery] Could not restore positions: {exc}")
 
-    def _reconcile_with_broker(self) -> None:
-        """Make the risk layer's positions match the broker (the source of truth) on startup."""
+    def _reconcile_with_broker(self, grace_seconds: float = 0.0) -> None:
+        """Make the risk layer's positions match the broker (the source of truth)."""
         try:
             # get_account()/get_positions() swallow errors and return {}/[]; an empty account
             # means the broker was unreachable, and then positions must NOT be reconciled.
@@ -297,44 +311,54 @@ class StockSageAgent:
                 logger.warning("[Reconcile] Broker unreachable; skipping position reconciliation")
                 return
             # Strict call: raises on failure instead of returning [] (which would look like "flat").
-            result = self.risk_manager.reconcile_positions(self.execution.get_positions_strict())
-            if result["dropped"] or result["resized"] or result["untracked"] or result["blocked_empty"]:
+            result = self.risk_manager.reconcile_positions(
+                self.execution.get_positions_strict(), grace_seconds=grace_seconds)
+            sig = (tuple(result["dropped"]), tuple(result["resized"]), tuple(result["untracked"]),
+                   tuple(result["blocked_empty"]))
+            if any(sig) and sig != self._last_reconcile_sig:   # alert on change, not every cycle
                 msg = (
                     f"Reconciled with broker | dropped={result['dropped']} "
                     f"resized={result['resized']} untracked(not adopted)={result['untracked']} "
-                    f"NOT dropped (broker showed none; verify manually)={result['blocked_empty']}"
+                    f"NOT dropped (broker showed none; verify manually)={result['blocked_empty']} "
+                    f"booked-at-cost(no mark)={result.get('unbooked', [])}"
                 )
                 console.print(f"[yellow]⚠️  {msg}[/yellow]")
+                logger.warning(msg)
                 self.notifier.error(msg)
+            self._last_reconcile_sig = sig
+            if result["dropped"] or result["resized"]:
                 self._persist_positions()
         except Exception as exc:
             logger.warning(f"[Reconcile] Could not reconcile with broker: {exc}")
 
     def _process_exit(self, symbol: str, price: float, reason: str) -> bool:
         """Sell at the broker, and record the close only if the broker accepted the order."""
-        if symbol not in self.risk_manager.positions:
-            return False  # already closed by another path (e.g. the AI SELL); nothing to do
-        logger.warning(f"🛑 Auto-exit: {symbol} @ ${price:.2f} ({reason})")
-        result = self.execution.sell(symbol, reason=reason)
-        if result.status in ("error", "rejected"):
-            err = (result.error_msg or "").lower()
-            if ("position does not exist" in err or "40410000" in err) and self._absent_at_broker(symbol):
-                # Confirmed against the broker's position list (not just an error string).
-                logger.warning(f"{symbol} is not held at the broker; closing local record")
-                self.risk_manager.close_position(symbol, price, "closed_at_broker")
-                self._persist_positions()
-                self.notifier.error(f"{symbol} was already closed at the broker; local record cleared")
-                self._exit_alerted.discard(symbol)
-                return True
-            logger.error(f"Exit sell failed for {symbol}: {result.error_msg}")
-            if symbol not in self._exit_alerted:  # alert once per symbol, not every minute
-                self._exit_alerted.add(symbol)
-                self.notifier.error(f"Exit sell FAILED for {symbol}: {result.error_msg} (retrying each cycle)")
-            return False
-        self._exit_alerted.discard(symbol)
-        pnl = self.risk_manager.close_position(symbol, price, reason)
-        self._persist_positions()
-        self.notifier.stop_loss(symbol, price, pnl)
+        with self._exit_lock:   # one sell/close at a time across the monitor and the main loop
+            if symbol not in self.risk_manager.positions:
+                return False  # already closed by another path (e.g. the AI SELL); nothing to do
+            logger.warning(f"🛑 Auto-exit: {symbol} @ ${price:.2f} ({reason})")
+            result = self.execution.sell(symbol, reason=reason)
+            if result.status in ("error", "rejected"):
+                err = (result.error_msg or "").lower()
+                if ("position does not exist" in err or "40410000" in err) and self._absent_at_broker(symbol):
+                    # Confirmed against the broker's position list (not just an error string).
+                    logger.warning(f"{symbol} is not held at the broker; closing local record")
+                    self.risk_manager.close_position(symbol, price, "closed_at_broker")
+                    self._persist_positions()
+                    self.notifier.error(f"{symbol} was already closed at the broker; local record cleared")
+                    self._exit_alerted.discard(symbol)
+                    return True
+                logger.error(f"Exit sell failed for {symbol}: {result.error_msg}")
+                if symbol not in self._exit_alerted:  # alert once per symbol, not every minute
+                    self._exit_alerted.add(symbol)
+                    self.notifier.error(
+                        f"Exit sell FAILED for {symbol}: {result.error_msg} (retrying each cycle)")
+                return False
+            self._exit_alerted.discard(symbol)
+            booked = self._booked_price(result, price)
+            pnl = self.risk_manager.close_position(symbol, booked, reason)
+            self._persist_positions()
+        self.notifier.stop_loss(symbol, booked, pnl)
         return True
 
     def _absent_at_broker(self, symbol: str) -> bool:
@@ -371,6 +395,9 @@ class StockSageAgent:
                 try:
                     if self.price_feed.is_market_open():
                         self._check_drawdown()
+                        self._monitor_tick += 1
+                        if self._monitor_tick % 5 == 0:   # about every 5 minutes: catch untracked
+                            self._reconcile_with_broker(grace_seconds=180)  # or externally closed
                         exits = self.decision_engine.check_exits()
                         for symbol, price, reason in exits:
                             self._process_exit(symbol, price, reason)

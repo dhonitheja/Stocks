@@ -39,8 +39,10 @@ def is_secret_path(path):
         return True
     if name == "credentials.json":
         return True
-    # "secret" in a data/config filename, but not source files like secrets_helper.py
-    return "secret" in name and ext not in (".py", ".md", ".rst", ".js", ".ts")
+    if ext in (".py", ".md", ".rst", ".js", ".ts", ".sh", ".ps1"):
+        return False      # source/docs that merely mention secrets or keys (e.g. secrets_helper.py)
+    # data/config files named like secrets or API keys: secrets.yaml, api_keys.json, my-key.txt
+    return "secret" in name or bool(re.search(r"(^|[._-])keys?($|[._-])", base))
 
 
 # .env, .env.local, .env.production ... but not .env.example
@@ -56,6 +58,10 @@ BASH_BLOCKED = [
     (r"DROP\s+TABLE", "destructive SQL"),
     (r"DELETE\s+FROM[^;]*WHERE\s+1\s*=\s*1", "destructive SQL"),
     (r"liquidate_all", "liquidating positions must be a human decision"),
+    (r"reset_drawdown_halt\s*\(", "clearing the drawdown halt must be a human decision"),
+    (r"risk_state[^\n]*(\brm\b|\bmv\b|\bcp\b|truncate|\btee\b|sed\s+-i|unlink|shred|Remove-Item|\bdel\b|>)|"
+     r"(\brm\b|\bmv\b|truncate|unlink|shred|Remove-Item|\bdel\b|>)[^\n]*risk_state",
+     "the drawdown-halt state file must not be removed or rewritten by scripts"),
 ]
 READS_ENV = [
     rf"\b(cat|type|head|tail|less|more|bat|nl|strings|xxd|od|cp|mv|scp|base64|tee)\s+[^|;&]*{ENVTOK}",
@@ -73,7 +79,14 @@ DOC_EXT = (".md", ".rst", ".txt")
 
 
 def scrub_quotes(cmd):
-    return re.sub(r"\"[^\"]*\"|'[^']*'", '""', cmd)
+    """Blank quoted message text, but never text that the shell would execute: single quotes are
+    literal; double quotes are kept when they contain $(...), `...` or ${...}."""
+    def repl(m):
+        txt = m.group(0)
+        if txt.startswith('"') and re.search(r"\$\(|`|\$\{", txt):
+            return txt
+        return '""'
+    return re.sub(r"\"[^\"]*\"|'[^']*'", repl, cmd)
 
 
 def edit_text(ti):
@@ -92,6 +105,9 @@ def check(payload):
         path = ti.get("file_path") or ti.get("notebook_path")
         if is_secret_path(path):
             block(f"{os.path.basename(path)} is a secrets file")
+        if tool != "Read" and os.path.basename(str(path or "")).startswith("risk_state"):
+            block("the drawdown-halt state file must only be changed by the running agent or "
+                  "scripts/reset_drawdown_halt.py (typed by a human)")
         if tool != "Read" and not str(path or "").lower().endswith(DOC_EXT):
             if LIVE_IN_CONTENT.search(edit_text(ti)):
                 block("do not hard-code TRADING_MODE=live in source")
