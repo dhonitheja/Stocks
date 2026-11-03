@@ -43,11 +43,18 @@ def to_frame(candles):
 
 
 def _scrub_env_after(importer):
-    """agent.config calls load_dotenv(), which would put the WHOLE .env (broker, Telegram, DB
-    secrets) in this process. Keep only what existed before plus the data-provider keys."""
+    """agent.config calls load_dotenv(), which would put the whole .env (broker, Telegram, DB
+    secrets) into this process's environment. Afterwards remove the names that the .env file
+    contributed, except the data-provider keys. This protects child processes and env dumps only:
+    agent.config has already read those values into its own module-level variables."""
+    try:
+        from dotenv import dotenv_values
+        dotenv_names = set(dotenv_values().keys())
+    except Exception:
+        dotenv_names = set()
     before = set(os.environ)
     result = importer()
-    for k in set(os.environ) - before:
+    for k in (set(os.environ) - before) & dotenv_names:
         if k not in stock_data._PROVIDER_VARS:
             del os.environ[k]
     return result

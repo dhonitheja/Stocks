@@ -318,10 +318,13 @@ def test_polygon_pacing_is_shared_across_processes(sd, monkeypatch):
     assert float(out.stdout.strip()) > 25, out.stderr
 
 
-def test_snapshot_403_is_remembered(sd):
+def test_snapshot_403_is_remembered_per_api_key(sd, monkeypatch):
+    monkeypatch.setenv("POLYGON_API_KEY", "free_plan_key_1")
     assert sd.snapshot_forbidden() is False
     sd.note_snapshot_forbidden()
     assert sd.snapshot_forbidden() is True
+    monkeypatch.setenv("POLYGON_API_KEY", "upgraded_key_2")      # new key/plan: not affected
+    assert sd.snapshot_forbidden() is False
 
 
 def test_scan_error_field_is_redacted(sd, monkeypatch, capsys):
@@ -358,7 +361,6 @@ def test_dotenv_only_copies_provider_keys(monkeypatch, tmp_path):
 
 
 def test_repo_signals_rejects_bad_tickers(monkeypatch, capsys):
-    pytest.importorskip("loguru")
     monkeypatch.setenv("STOCK_DATA_NO_DOTENV", "1")
     rs = _load("repo_signals")
     monkeypatch.setattr(sys, "argv", ["repo_signals.py", "AA PL; rm -rf /"])
@@ -367,22 +369,30 @@ def test_repo_signals_rejects_bad_tickers(monkeypatch, capsys):
     assert "invalid ticker" in str(e.value)
 
 
-def test_bridge_does_not_leave_non_provider_secrets_in_environment(monkeypatch):
+def test_bridge_removes_only_dotenv_sourced_non_provider_names(monkeypatch):
     pytest.importorskip("loguru")
     monkeypatch.setenv("STOCK_DATA_NO_DOTENV", "1")
     rs = _load("repo_signals")
     import os
+    import dotenv
+    monkeypatch.setattr(dotenv, "dotenv_values", lambda *a, **k: {
+        "ALPACA_SECRET_KEY": "x", "POLYGON_API_KEY": "y", "TELEGRAM_BOT_TOKEN": "z"})
 
     def importer():
-        os.environ["ALPACA_SECRET_KEY"] = "leaky"      # what agent.config's load_dotenv would do
-        os.environ["POLYGON_API_KEY"] = "keepme"
+        os.environ["ALPACA_SECRET_KEY"] = "leaky"          # from .env: must go
+        os.environ["TELEGRAM_BOT_TOKEN"] = "leaky2"        # from .env: must go
+        os.environ["POLYGON_API_KEY"] = "keepme"           # provider key: stays
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"     # a library's own setting: stays
         return "ok"
 
-    monkeypatch.delenv("ALPACA_SECRET_KEY", raising=False)
-    monkeypatch.delenv("POLYGON_API_KEY", raising=False)
+    for v in ("ALPACA_SECRET_KEY", "TELEGRAM_BOT_TOKEN", "POLYGON_API_KEY", "TOKENIZERS_PARALLELISM"):
+        monkeypatch.delenv(v, raising=False)
     assert rs._scrub_env_after(importer) == "ok"
-    assert "ALPACA_SECRET_KEY" not in os.environ and os.environ.get("POLYGON_API_KEY") == "keepme"
-    monkeypatch.delenv("POLYGON_API_KEY", raising=False)
+    assert "ALPACA_SECRET_KEY" not in os.environ and "TELEGRAM_BOT_TOKEN" not in os.environ
+    assert os.environ.get("POLYGON_API_KEY") == "keepme"
+    assert os.environ.get("TOKENIZERS_PARALLELISM") == "false"
+    for v in ("POLYGON_API_KEY", "TOKENIZERS_PARALLELISM"):
+        monkeypatch.delenv(v, raising=False)
 
 
 def test_agent_allowlist_is_narrow():
@@ -393,3 +403,101 @@ def test_agent_allowlist_is_narrow():
         assert loose not in tools
     assert "Bash(python scripts/research/stock_data.py *)" in tools
     assert "Bash(twitter search *)" in tools
+
+
+# ---- third review round ------------------------------------------------------------
+
+def test_state_file_refuses_symlinks(sd, tmp_path, monkeypatch):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious")
+    link = tmp_path / "state.json"
+    link.symlink_to(victim)
+    monkeypatch.setattr(sd, "_STATE_FILE", str(link))
+    sd._with_state(lambda st: st.__setitem__("x", 1))
+    assert victim.read_text() == "precious"                   # the symlink target was not touched
+
+
+def test_state_file_refuses_group_or_world_writable_files(sd, tmp_path, monkeypatch):
+    f = tmp_path / "state.json"
+    f.write_text('{"polygon_next": 0}')
+    f.chmod(0o666)
+    monkeypatch.setattr(sd, "_STATE_FILE", str(f))
+    assert sd._open_state() is None
+    f.chmod(0o600)
+    fd = sd._open_state()
+    assert fd is not None
+    import os
+    os.close(fd)
+
+
+def test_state_file_and_dir_are_private(sd, tmp_path, monkeypatch):
+    import os
+    target = tmp_path / "newdir" / "state.json"
+    monkeypatch.setattr(sd, "_STATE_FILE", str(target))
+    sd._with_state(lambda st: None)
+    assert (target.stat().st_mode & 0o777) == 0o600
+    assert (target.parent.stat().st_mode & 0o777) == 0o700
+
+
+@pytest.mark.parametrize("poison", ['{"polygon_next": 1e12}', '{"polygon_next": Infinity}',
+                                    '{"polygon_next": NaN}', '[1,2]', '{"polygon_next": "x"}', "garbage"])
+def test_poisoned_state_cannot_hang_or_crash_the_cli(sd, tmp_path, monkeypatch, poison):
+    f = tmp_path / "state.json"
+    f.write_text(poison)
+    f.chmod(0o600)
+    monkeypatch.setattr(sd, "_STATE_FILE", str(f))
+    monkeypatch.setenv("POLYGON_MIN_INTERVAL", "12.5")
+    wait = sd._polygon_wait()
+    assert 0 <= wait <= 65
+
+
+def test_oversized_response_is_rejected_clearly(sd, monkeypatch):
+    class Big:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self, n=-1): return b"x" * n
+    monkeypatch.setattr(sd.urllib.request, "urlopen", lambda *a, **k: Big())
+    with pytest.raises(RuntimeError, match="response too large"):
+        sd.http_json("https://api.finnhub.io/x", {"token": "K"})
+
+
+@pytest.mark.parametrize("days", ["0", "-3", "999999999"])
+def test_days_out_of_range_is_a_clean_error(sd, monkeypatch, days):
+    monkeypatch.setenv("FINNHUB_API_KEY", "realkey123")
+    monkeypatch.setattr(sd.sys, "argv", ["stock_data.py", "candles", "AAPL", "--days", days])
+    with pytest.raises(SystemExit) as e:
+        sd.main()
+    assert "--days" in str(e.value)
+
+
+def _allowlist_patterns():
+    text = (ROOT / ".claude" / "agents" / "stock-analyst.md").read_text(encoding="utf-8")
+    tools = next(l for l in text.splitlines() if l.startswith("tools:"))
+    import re as _re
+    return _re.findall(r"Bash\(([^)]*)\)", tools)
+
+
+def test_every_command_in_the_skills_is_covered_by_the_allowlist():
+    import fnmatch
+    import re as _re
+    pats = _allowlist_patterns()
+    prefixes = ("python scripts/research/", "mcporter call exa.", "rdt search", "twitter search",
+                "opencli reddit search", "agent-reach doctor")
+    found = []
+    for md in (ROOT / ".claude" / "skills").glob("*/SKILL.md"):
+        for line in md.read_text(encoding="utf-8").splitlines():
+            for m in _re.finditer(r"`([^`]+)`", line):
+                cmd = m.group(1).strip()
+                if cmd.startswith(prefixes):
+                    found.append((md.parent.name, cmd))
+    assert found, "no commands found in skills (test is vacuous)"
+    for skill, cmd in found:
+        concrete = cmd.replace("T1 T2 ...", "AAPL MSFT").replace(" T ", " AAPL ").replace(
+            "<tickers>", "AAPL").replace("<universe>", "AAPL")
+        assert any(fnmatch.fnmatchcase(concrete, p) for p in pats), (skill, cmd, pats)
+
+
+def test_agent_allowlist_has_no_loose_patterns():
+    pats = _allowlist_patterns()
+    assert "agent-reach doctor *" in pats and "agent-reach doctor*" not in pats
+    assert all("*" not in p.split(" ")[0] for p in pats)

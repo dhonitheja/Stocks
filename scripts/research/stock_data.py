@@ -85,10 +85,34 @@ def redact(msg):
     return msg
 
 
-import tempfile
+import hashlib
+import stat
 
-_STATE_FILE = os.path.join(tempfile.gettempdir(), f"stock_data_state_{os.getuid() if hasattr(os, 'getuid') else 'u'}.json")
+_STATE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "stock-agent")   # per-user, mode 0700
+_STATE_FILE = os.path.join(_STATE_DIR, "stock_data_state.json")
 _MAX_BYTES = 5_000_000  # refuse absurdly large responses
+_MAX_SLEEP = 65.0       # never sleep longer than this, whatever a state file says
+
+
+def _open_state():
+    """Open the shared state file safely, or return None (callers then run without shared state).
+    Refuses symlinks, non-regular files, and files not owned by us or writable by others."""
+    try:
+        os.makedirs(os.path.dirname(_STATE_FILE), mode=0o700, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        fd = os.open(_STATE_FILE, flags, 0o600)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        uid_ok = not hasattr(os, "getuid") or st.st_uid == os.getuid()
+        if not (stat.S_ISREG(st.st_mode) and uid_ok and not (st.st_mode & 0o022)):
+            os.close(fd)
+            return None
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
 
 
 def _with_state(fn):
@@ -98,15 +122,14 @@ def _with_state(fn):
         import fcntl
     except ImportError:  # Windows: best effort without a lock
         fcntl = None
-    try:
-        fd = os.open(_STATE_FILE, os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError:
+    fd = _open_state()
+    if fd is None:
         return fn({})
     try:
         if fcntl:
             fcntl.flock(fd, fcntl.LOCK_EX)
         raw = b""
-        while True:
+        while len(raw) < 1_000_000:
             chunk = os.read(fd, 65536)
             if not chunk:
                 break
@@ -126,28 +149,55 @@ def _with_state(fn):
         os.close(fd)  # closing releases the flock
 
 
+def _num(v, default=0.0):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
+
+
 def _polygon_wait():
-    """Reserve the next Polygon slot (free plan: 5 calls/min). POLYGON_MIN_INTERVAL=0 on paid plans."""
-    gap = float(os.environ.get("POLYGON_MIN_INTERVAL", "12.5"))
+    """Reserve the next Polygon slot (free plan: 5 calls/min). POLYGON_MIN_INTERVAL=0 on paid plans.
+    The wait is clamped, so a poisoned or stale state file can never hang the CLI."""
+    gap = min(max(_num(os.environ.get("POLYGON_MIN_INTERVAL", "12.5"), 12.5), 0.0), 60.0)
     if gap <= 0:
         return 0.0
 
     def reserve(state):
         now = time.time()
-        slot = max(now, float(state.get("polygon_next", 0)))
+        slot = max(now, _num(state.get("polygon_next")))
+        slot = min(slot, now + 5 * gap)          # never queue further than 5 calls ahead
         state["polygon_next"] = slot + gap
-        return slot - now
+        return min(slot - now, _MAX_SLEEP)
 
     return _with_state(reserve)
 
 
+def _key_id(p="polygon"):
+    return hashlib.sha256(os.environ.get(ENV[p], "").encode()).hexdigest()[:12]
+
+
 def snapshot_forbidden():
-    """True if Polygon's snapshot endpoint answered 403 recently (free plan); saves ~12s per quote."""
-    return _with_state(lambda st: time.time() < float(st.get("snapshot_403_until", 0)))
+    """True if Polygon's snapshot endpoint answered 403 recently FOR THIS API KEY (free plan)."""
+    kid = _key_id()
+
+    def check(st):
+        d = st.get("snapshot_403", {})
+        return isinstance(d, dict) and time.time() < _num(d.get(kid))
+
+    return _with_state(check)
 
 
 def note_snapshot_forbidden():
-    _with_state(lambda st: st.__setitem__("snapshot_403_until", time.time() + 6 * 3600))
+    kid = _key_id()
+
+    def mark(st):
+        d = st.get("snapshot_403")
+        st["snapshot_403"] = d if isinstance(d, dict) else {}
+        st["snapshot_403"][kid] = time.time() + 6 * 3600     # a different key/plan is not affected
+
+    _with_state(mark)
 
 
 def _throttle(url):
@@ -170,7 +220,10 @@ def http_json(url, params, _retry=True):
     req = urllib.request.Request(full, headers={"User-Agent": "stock-agent/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
-            d = json.loads(r.read(_MAX_BYTES + 1)[:_MAX_BYTES] if hasattr(r, "read") else r)
+            raw = r.read(_MAX_BYTES + 1)
+            if len(raw) > _MAX_BYTES:
+                raise RuntimeError("response too large")
+            d = json.loads(raw)
     except urllib.error.HTTPError as e:
         if e.code == 403:
             raise RuntimeError("403: endpoint needs a paid plan on this provider") from None
@@ -181,6 +234,8 @@ def http_json(url, params, _retry=True):
             raise RuntimeError("429: rate limited") from None
         raise RuntimeError(f"HTTP {e.code} from {urllib.parse.urlparse(url).netloc}") from None
     except Exception as e:  # never let a URL (which carries the key) leak through an exception
+        if isinstance(e, RuntimeError) and str(e) == "response too large":
+            raise RuntimeError(f"response too large from {urllib.parse.urlparse(url).netloc}") from None
         raise RuntimeError(f"{type(e).__name__} calling {urllib.parse.urlparse(url).netloc}") from None
     # Alpha Vantage returns HTTP 200 with these keys when limited or premium-only
     if isinstance(d, dict):
@@ -411,8 +466,8 @@ def main():
     ap.add_argument("--days", type=int)
     a = ap.parse_args()
     days = a.days
-    if days is not None and days < 1:
-        sys.exit("error: --days must be 1 or more")
+    if days is not None and not 1 <= days <= 5000:
+        sys.exit("error: --days must be between 1 and 5000")
     tickers = [valid_ticker(t) for t in a.tickers]
     if a.cmd != "scan" and len(tickers) > 1:
         sys.exit("error: this command takes one ticker; use scan for several")
@@ -436,7 +491,7 @@ def main():
                 cp, c = run("candles", lambda p: candles(p, tk, 250), f)
                 res.append({"ticker": tk, "quote_provider": qp, "candle_provider": cp,
                             **q, "ind": indicators(c)})
-            except (SystemExit, Exception) as e:  # keep scanning if one ticker fails
+            except (SystemExit, Exception) as e:  # keep scanning if one ticker fails (run() exits on failure)
                 res.append({"ticker": tk, "error": redact(e)})
     print(json.dumps({"provider": p, "data": res}, indent=2))
 
