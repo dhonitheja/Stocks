@@ -94,20 +94,49 @@ _MAX_BYTES = 5_000_000  # refuse absurdly large responses
 _MAX_SLEEP = 65.0       # never sleep longer than this, whatever a state file says
 
 
+_LOCAL_STATE: dict = {}      # in-process fallback when the shared file is unusable
+_WARNED_STATE = False
+
+
+def _warn_state(reason):
+    global _WARNED_STATE
+    if not _WARNED_STATE:
+        _WARNED_STATE = True
+        print(f"stock_data: shared state unavailable ({reason}); pacing and 403 memory are "
+              "per-process only", file=sys.stderr)
+
+
+def _check_state_dir(path):
+    """The state directory must be a real directory (not a symlink) that we own, private (0700).
+    A directory we own with loose permissions is tightened; anything else is refused."""
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError("state directory is not a real directory (symlink?)")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise OSError("state directory is owned by another user")
+    if st.st_mode & 0o077:
+        os.chmod(path, 0o700)
+
+
 def _open_state():
-    """Open the shared state file safely, or return None (callers then run without shared state).
-    Refuses symlinks, non-regular files, and files not owned by us or writable by others."""
+    """Open the shared state file safely, or return None (callers then use the in-process fallback).
+    Refuses symlinks (file or directory), non-regular files, hardlinked files, files not owned by us
+    or writable by others, and directories owned by others or left group/world accessible."""
     try:
-        os.makedirs(os.path.dirname(_STATE_FILE), mode=0o700, exist_ok=True)
+        d = os.path.dirname(_STATE_FILE)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        _check_state_dir(d)
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         fd = os.open(_STATE_FILE, flags, 0o600)
-    except OSError:
+    except OSError as e:
+        _warn_state(str(e) or type(e).__name__)
         return None
     try:
         st = os.fstat(fd)
         uid_ok = not hasattr(os, "getuid") or st.st_uid == os.getuid()
-        if not (stat.S_ISREG(st.st_mode) and uid_ok and not (st.st_mode & 0o022)):
+        if not (stat.S_ISREG(st.st_mode) and uid_ok and not (st.st_mode & 0o022) and st.st_nlink == 1):
             os.close(fd)
+            _warn_state("state file is not a private regular file")
             return None
     except OSError:
         os.close(fd)
@@ -117,19 +146,24 @@ def _open_state():
 
 def _with_state(fn):
     """Run fn(state_dict) under an inter-process lock; state is saved back. Shared by all CLI runs
-    (the agent fetches in parallel), so pacing and 403 memory hold across processes."""
+    (the agent fetches in parallel), so pacing and 403 memory hold across processes. If the shared
+    file cannot be used, a module-level dict keeps pacing working within this process."""
     try:
         import fcntl
     except ImportError:  # Windows: best effort without a lock
         fcntl = None
     fd = _open_state()
     if fd is None:
-        return fn({})
+        return fn(_LOCAL_STATE)
     try:
         if fcntl:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError as e:               # e.g. ENOLCK on network filesystems
+                _warn_state(f"cannot lock state file: {e}")
+                return fn(_LOCAL_STATE)
         raw = b""
-        while len(raw) < 1_000_000:
+        while len(raw) < 1_000_000:           # an oversized file is treated as corrupt (reset below)
             chunk = os.read(fd, 65536)
             if not chunk:
                 break
@@ -143,7 +177,7 @@ def _with_state(fn):
         result = fn(state)
         os.lseek(fd, 0, os.SEEK_SET)
         os.ftruncate(fd, 0)
-        os.write(fd, json.dumps(state).encode())
+        os.write(fd, json.dumps(state).encode())   # tiny; a short write would just reset the state
         return result
     finally:
         os.close(fd)  # closing releases the flock
@@ -157,6 +191,10 @@ def _num(v, default=0.0):
     return v if math.isfinite(v) else default
 
 
+class _TooLarge(Exception):
+    pass
+
+
 def _polygon_wait():
     """Reserve the next Polygon slot (free plan: 5 calls/min). POLYGON_MIN_INTERVAL=0 on paid plans.
     The wait is clamped, so a poisoned or stale state file can never hang the CLI."""
@@ -166,12 +204,20 @@ def _polygon_wait():
 
     def reserve(state):
         now = time.time()
-        slot = max(now, _num(state.get("polygon_next")))
-        slot = min(slot, now + 5 * gap)          # never queue further than 5 calls ahead
+        nxt = _num(state.get("polygon_next"))
+        if nxt > now + 6 * gap + 1:              # impossible via normal use (max is now + 6*gap): corrupt
+            nxt = 0.0
+        slot = max(now, nxt)
+        if slot - now > 5 * gap:                 # 5 calls already queued: do not stack a 6th on top
+            return None
         state["polygon_next"] = slot + gap
         return min(slot - now, _MAX_SLEEP)
 
-    return _with_state(reserve)
+    wait = _with_state(reserve)
+    if wait is None:
+        raise RuntimeError("polygon: rate-limit queue full (5 calls already waiting); try later "
+                           "or use another provider")
+    return wait
 
 
 def _key_id(p="polygon"):
@@ -194,8 +240,10 @@ def note_snapshot_forbidden():
 
     def mark(st):
         d = st.get("snapshot_403")
-        st["snapshot_403"] = d if isinstance(d, dict) else {}
-        st["snapshot_403"][kid] = time.time() + 6 * 3600     # a different key/plan is not affected
+        now = time.time()
+        d = d if isinstance(d, dict) else {}
+        st["snapshot_403"] = {k: v for k, v in d.items() if _num(v) > now}   # drop expired entries
+        st["snapshot_403"][kid] = now + 6 * 3600     # a different key/plan is not affected
 
     _with_state(mark)
 
@@ -222,7 +270,7 @@ def http_json(url, params, _retry=True):
         with urllib.request.urlopen(req, timeout=20) as r:
             raw = r.read(_MAX_BYTES + 1)
             if len(raw) > _MAX_BYTES:
-                raise RuntimeError("response too large")
+                raise _TooLarge()
             d = json.loads(raw)
     except urllib.error.HTTPError as e:
         if e.code == 403:
@@ -234,7 +282,7 @@ def http_json(url, params, _retry=True):
             raise RuntimeError("429: rate limited") from None
         raise RuntimeError(f"HTTP {e.code} from {urllib.parse.urlparse(url).netloc}") from None
     except Exception as e:  # never let a URL (which carries the key) leak through an exception
-        if isinstance(e, RuntimeError) and str(e) == "response too large":
+        if isinstance(e, _TooLarge):
             raise RuntimeError(f"response too large from {urllib.parse.urlparse(url).netloc}") from None
         raise RuntimeError(f"{type(e).__name__} calling {urllib.parse.urlparse(url).netloc}") from None
     # Alpha Vantage returns HTTP 200 with these keys when limited or premium-only

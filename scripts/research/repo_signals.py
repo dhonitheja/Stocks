@@ -51,11 +51,13 @@ def _scrub_env_after(importer):
         from dotenv import dotenv_values
         dotenv_names = set(dotenv_values().keys())
     except Exception:
-        dotenv_names = set()
+        dotenv_names = None          # cannot tell which names came from .env: fail closed below
     before = set(os.environ)
     result = importer()
-    for k in (set(os.environ) - before) & dotenv_names:
-        if k not in stock_data._PROVIDER_VARS:
+    for k in set(os.environ) - before:
+        if k in stock_data._PROVIDER_VARS:
+            continue
+        if dotenv_names is None or k in dotenv_names:
             del os.environ[k]
     return result
 
