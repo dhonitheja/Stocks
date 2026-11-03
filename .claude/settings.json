@@ -2,11 +2,20 @@
   "hooks": {
     "PreToolUse": [
       {
+        "matcher": "Read|Grep|Glob|Bash|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PY=python3; python3 -c \"\" >/dev/null 2>&1 || PY=python; $PY -c \"\" >/dev/null 2>&1 || { echo \"guard.py: no working python interpreter; blocking\" >&2; exit 2; }; $PY \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\"; rc=$?; [ \"$rc\" -eq 0 ] || { [ \"$rc\" -eq 2 ] || echo \"guard.py crashed (exit $rc); failing closed\" >&2; exit 2; }"
+          }
+        ]
+      },
+      {
         "matcher": "Read|Grep|Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -ExecutionPolicy Bypass -File \".claude/hooks/protect-env.ps1\""
+            "command": "if command -v powershell >/dev/null 2>&1; then powershell -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/protect-env.ps1\"; fi"
           }
         ]
       }

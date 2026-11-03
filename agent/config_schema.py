@@ -28,6 +28,7 @@ class RiskConfig(BaseModel):
     max_sector_pct: float = Field(gt=0, le=1)
     min_cash_reserve_pct: float = Field(ge=0, lt=1)
     max_daily_loss_pct: float = Field(gt=0, le=1)
+    max_drawdown_pct: float = Field(default=0.15, gt=0, le=1)
     max_trade_loss_pct: float = Field(gt=0, le=1)
     trailing_stop_pct: float = Field(gt=0, le=1)
     min_confidence_score: float = Field(ge=0, le=1)

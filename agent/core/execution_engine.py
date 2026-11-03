@@ -220,23 +220,39 @@ class ExecutionEngine:
             logger.error(f"Failed to fetch account: {e}")
             return {}
 
-    def get_positions(self) -> List[Dict]:
-        """Get all open positions."""
+    def get_positions_strict(self) -> List[Dict]:
+        """Like get_positions() but raises on failure, so callers can tell "none" from "error"."""
         self._ensure_connected()
+        positions = self._trading_client.get_all_positions()
+
+        def num(v):
+            """Broker fields can be None (e.g. no current price); never let one abort the list."""
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        out = []
+        for p in positions:
+            qty = num(p.qty)
+            if qty is None:
+                raise ValueError(f"broker returned no quantity for {p.symbol}")  # do not guess
+            plpc = num(p.unrealized_plpc)
+            out.append({
+                "symbol": p.symbol,
+                "qty": qty,
+                "avg_entry": num(p.avg_entry_price),
+                "current_price": num(p.current_price),
+                "market_value": num(p.market_value),
+                "unrealized_pnl": num(p.unrealized_pl),
+                "unrealized_pnl_pct": plpc * 100 if plpc is not None else None,
+            })
+        return out
+
+    def get_positions(self) -> List[Dict]:
+        """Get all open positions (returns [] on error; use get_positions_strict to detect it)."""
         try:
-            positions = self._trading_client.get_all_positions()
-            return [
-                {
-                    "symbol": p.symbol,
-                    "qty": float(p.qty),
-                    "avg_entry": float(p.avg_entry_price),
-                    "current_price": float(p.current_price),
-                    "market_value": float(p.market_value),
-                    "unrealized_pnl": float(p.unrealized_pl),
-                    "unrealized_pnl_pct": float(p.unrealized_plpc) * 100,
-                }
-                for p in positions
-            ]
+            return self.get_positions_strict()
         except Exception as e:
             logger.error(f"Failed to fetch positions: {e}")
             return []
